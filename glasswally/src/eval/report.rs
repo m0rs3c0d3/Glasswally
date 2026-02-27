@@ -10,7 +10,7 @@ pub fn auc_roc_approx(result: &EvalResult) -> f64 {
     // Without per-event score + label pairs we approximate from the histogram.
     // A proper AUC requires sorting all events by score and computing the exact curve.
     // This placeholder returns the F1 score as a proxy when per-event data is unavailable.
-    let p = result.global.precision();
+    let _p = result.global.precision();
     let r = result.global.recall();
     // Approximate: AUC ≈ (1 + TPR - FPR) / 2
     let tpr = r;
@@ -23,8 +23,10 @@ pub fn print_markdown(result: &EvalResult) {
     let auc = auc_roc_approx(result);
     println!("# Glasswally Evaluation Report");
     println!();
-    println!("**Events**: {}  **Positive**: {}  **Negative**: {}  **Threshold**: {:.3}",
-        result.n_events, result.n_positive, result.n_negative, result.threshold);
+    println!(
+        "**Events**: {}  **Positive**: {}  **Negative**: {}  **Threshold**: {:.3}",
+        result.n_events, result.n_positive, result.n_negative, result.threshold
+    );
     println!();
     println!("| Metric    | Value  |");
     println!("|-----------|--------|");
@@ -50,5 +52,6 @@ pub fn to_json(result: &EvalResult) -> String {
         "fpr":         result.global.fpr(),
         "auc_roc":     auc_roc_approx(result),
         "tier_counts": result.tier_counts,
-    }).to_string()
+    })
+    .to_string()
 }

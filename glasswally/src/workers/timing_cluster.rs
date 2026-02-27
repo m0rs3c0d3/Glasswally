@@ -24,10 +24,10 @@ use serde_json::json;
 use crate::events::{ApiEvent, DetectionSignal, WorkerKind};
 use crate::state::window::StateStore;
 
-const MIN_BURST_SIZE:   usize = 5;   // accounts per 1s window to fire signal
-const STRONG_BURST:     usize = 12;  // accounts per window for high confidence
-const RECUR_MIN_BURSTS: usize = 3;   // recurring bursts needed to confirm cadence
-const CADENCE_LOOKBACK: u64   = 300; // seconds of history to scan for cadence
+const MIN_BURST_SIZE: usize = 5; // accounts per 1s window to fire signal
+const STRONG_BURST: usize = 12; // accounts per window for high confidence
+const RECUR_MIN_BURSTS: usize = 3; // recurring bursts needed to confirm cadence
+const CADENCE_LOOKBACK: u64 = 300; // seconds of history to scan for cadence
 
 pub async fn analyze(event: &ApiEvent, store: &StateStore) -> Option<DetectionSignal> {
     let bucket = event.timestamp.timestamp() as u64;
@@ -36,14 +36,16 @@ pub async fn analyze(event: &ApiEvent, store: &StateStore) -> Option<DetectionSi
     // We just query here — no side effects in the worker.
     let n_concurrent = store.accounts_in_bucket(bucket);
 
-    if n_concurrent < MIN_BURST_SIZE { return None; }
+    if n_concurrent < MIN_BURST_SIZE {
+        return None;
+    }
 
-    let mut score    = 0.0f32;
+    let mut score = 0.0f32;
     let mut evidence = Vec::new();
 
     // ── Current bucket burst ──────────────────────────────────────────────────
-    let burst_frac = (n_concurrent - MIN_BURST_SIZE) as f32
-        / (STRONG_BURST - MIN_BURST_SIZE) as f32;
+    let burst_frac =
+        (n_concurrent - MIN_BURST_SIZE) as f32 / (STRONG_BURST - MIN_BURST_SIZE) as f32;
     score += (burst_frac * 0.50).min(0.50);
     evidence.push(format!("sync_burst:{}_accounts_in_1s", n_concurrent));
 
@@ -52,24 +54,32 @@ pub async fn analyze(event: &ApiEvent, store: &StateStore) -> Option<DetectionSi
     let burst_times: Vec<u64> = (1..=CADENCE_LOOKBACK)
         .filter_map(|i| {
             let b = bucket.saturating_sub(i);
-            if store.accounts_in_bucket(b) >= MIN_BURST_SIZE { Some(b) } else { None }
+            if store.accounts_in_bucket(b) >= MIN_BURST_SIZE {
+                Some(b)
+            } else {
+                None
+            }
         })
         .collect();
 
     let n_prior_bursts = burst_times.len();
     if n_prior_bursts >= RECUR_MIN_BURSTS {
         score += 0.30;
-        evidence.push(format!("recurring_sync:{}_bursts_in_{}s", n_prior_bursts, CADENCE_LOOKBACK));
+        evidence.push(format!(
+            "recurring_sync:{}_bursts_in_{}s",
+            n_prior_bursts, CADENCE_LOOKBACK
+        ));
 
         // Measure cadence regularity (low CV = clock-driven)
         if burst_times.len() >= 3 {
-            let gaps: Vec<f64> = burst_times.windows(2)
-                .map(|w| (w[0] - w[1]) as f64)   // descending timestamps → positive gaps
+            let gaps: Vec<f64> = burst_times
+                .windows(2)
+                .map(|w| (w[0] - w[1]) as f64) // descending timestamps → positive gaps
                 .collect();
             let mean = gaps.iter().sum::<f64>() / gaps.len() as f64;
-            let std  = (gaps.iter().map(|x| (x - mean).powi(2)).sum::<f64>()
-                        / gaps.len() as f64).sqrt();
-            let cv   = if mean > 1.0 { std / mean } else { 1.0 };
+            let std =
+                (gaps.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / gaps.len() as f64).sqrt();
+            let cv = if mean > 1.0 { std / mean } else { 1.0 };
 
             if cv < 0.15 {
                 score += 0.20;
@@ -84,16 +94,18 @@ pub async fn analyze(event: &ApiEvent, store: &StateStore) -> Option<DetectionSi
     let confidence = (n_concurrent as f32 / STRONG_BURST as f32).min(1.0);
 
     Some(DetectionSignal {
-        worker:     WorkerKind::TimingCluster,
+        worker: WorkerKind::TimingCluster,
         account_id: event.account_id.clone(),
-        score:      score.min(1.0),
+        score: score.min(1.0),
         confidence,
         evidence,
         meta: [
-            ("n_concurrent".into(),   json!(n_concurrent)),
-            ("bucket_ts".into(),      json!(bucket)),
+            ("n_concurrent".into(), json!(n_concurrent)),
+            ("bucket_ts".into(), json!(bucket)),
             ("n_prior_bursts".into(), json!(n_prior_bursts)),
-        ].into_iter().collect(),
+        ]
+        .into_iter()
+        .collect(),
         timestamp: Utc::now(),
     })
 }

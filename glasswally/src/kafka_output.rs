@@ -27,11 +27,10 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use anyhow::Result;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::events::{EnforcementAction, IocBundle};
 
@@ -40,24 +39,24 @@ use crate::events::{EnforcementAction, IocBundle};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KafkaConfig {
     /// Comma-separated broker list (e.g. "kafka1:9092,kafka2:9092")
-    pub brokers:            String,
-    pub enforcement_topic:  String,
-    pub ioc_topic:          String,
-    pub signals_topic:      String,
+    pub brokers: String,
+    pub enforcement_topic: String,
+    pub ioc_topic: String,
+    pub signals_topic: String,
     /// Maximum in-memory queue depth before dropping oldest (back-pressure)
-    pub max_queue:          usize,
+    pub max_queue: usize,
     /// Flush interval in milliseconds
-    pub flush_interval_ms:  u64,
+    pub flush_interval_ms: u64,
 }
 
 impl Default for KafkaConfig {
     fn default() -> Self {
         Self {
-            brokers:           "localhost:9092".to_string(),
+            brokers: "localhost:9092".to_string(),
             enforcement_topic: "glasswally.enforcement".to_string(),
-            ioc_topic:         "glasswally.ioc".to_string(),
-            signals_topic:     "glasswally.signals".to_string(),
-            max_queue:         8192,
+            ioc_topic: "glasswally.ioc".to_string(),
+            signals_topic: "glasswally.signals".to_string(),
+            max_queue: 8192,
             flush_interval_ms: 100,
         }
     }
@@ -67,10 +66,10 @@ impl Default for KafkaConfig {
 
 #[derive(Debug, Clone, Serialize)]
 struct KafkaMessage {
-    topic:   String,
-    key:     String,   // account_id for ordering
-    payload: String,   // JSON body
-    ts:      chrono::DateTime<Utc>,
+    topic: String,
+    key: String,     // account_id for ordering
+    payload: String, // JSON body
+    ts: chrono::DateTime<Utc>,
 }
 
 // ── Adapter ───────────────────────────────────────────────────────────────────
@@ -78,46 +77,63 @@ struct KafkaMessage {
 pub struct KafkaAdapter {
     config: KafkaConfig,
     /// In-memory queue — drained by background flush task.
-    queue:  Arc<Mutex<VecDeque<KafkaMessage>>>,
+    queue: Arc<Mutex<VecDeque<KafkaMessage>>>,
     /// Running message count (for metrics).
-    pub published:  std::sync::atomic::AtomicU64,
-    pub dropped:    std::sync::atomic::AtomicU64,
+    pub published: std::sync::atomic::AtomicU64,
+    pub dropped: std::sync::atomic::AtomicU64,
 }
 
 impl KafkaAdapter {
     pub fn new(config: KafkaConfig) -> Arc<Self> {
         let adapter = Arc::new(Self {
             config,
-            queue:     Arc::new(Mutex::new(VecDeque::new())),
+            queue: Arc::new(Mutex::new(VecDeque::new())),
             published: std::sync::atomic::AtomicU64::new(0),
-            dropped:   std::sync::atomic::AtomicU64::new(0),
+            dropped: std::sync::atomic::AtomicU64::new(0),
         });
-        info!("Kafka adapter configured, brokers={}", adapter.config.brokers);
+        info!(
+            "Kafka adapter configured, brokers={}",
+            adapter.config.brokers
+        );
         adapter
     }
 
     /// Publish an enforcement action to the enforcement topic.
     pub async fn publish_enforcement(&self, action: &EnforcementAction) {
         let key = action.account_id.clone().unwrap_or_default();
-        self.enqueue(self.config.enforcement_topic.clone(), key,
-            serde_json::to_string(action).unwrap_or_default()).await;
+        self.enqueue(
+            self.config.enforcement_topic.clone(),
+            key,
+            serde_json::to_string(action).unwrap_or_default(),
+        )
+        .await;
     }
 
     /// Publish an IOC bundle (cluster takedown) to the IOC topic.
     pub async fn publish_ioc(&self, bundle: &IocBundle) {
         let key = format!("cluster_{}", bundle.cluster_id);
-        self.enqueue(self.config.ioc_topic.clone(), key,
-            serde_json::to_string(bundle).unwrap_or_default()).await;
+        self.enqueue(
+            self.config.ioc_topic.clone(),
+            key,
+            serde_json::to_string(bundle).unwrap_or_default(),
+        )
+        .await;
     }
 
     async fn enqueue(&self, topic: String, key: String, payload: String) {
         let mut q = self.queue.lock().await;
         if q.len() >= self.config.max_queue {
             q.pop_front(); // drop oldest
-            self.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.dropped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             warn!("Kafka queue full — dropped oldest message");
         }
-        q.push_back(KafkaMessage { topic, key, payload, ts: Utc::now() });
+        q.push_back(KafkaMessage {
+            topic,
+            key,
+            payload,
+            ts: Utc::now(),
+        });
     }
 
     /// Background flush loop — sends queued messages to Kafka.
@@ -130,7 +146,9 @@ impl KafkaAdapter {
                 let mut q = self.queue.lock().await;
                 q.drain(..).collect()
             };
-            if batch.is_empty() { continue; }
+            if batch.is_empty() {
+                continue;
+            }
 
             // Production: send via rdkafka FutureProducer.
             // Stub: log as JSONL.
@@ -142,7 +160,8 @@ impl KafkaAdapter {
                 // In production: producer.send(record, timeout).await
             }
 
-            self.published.fetch_add(batch.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            self.published
+                .fetch_add(batch.len() as u64, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }

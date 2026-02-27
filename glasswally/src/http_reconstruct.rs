@@ -12,10 +12,7 @@
 
 use std::collections::HashMap;
 
-use chrono::Utc;
-use tracing::{debug, warn};
-
-use crate::events::{ConnKey, HttpRequest, SslCapture, SslDirection};
+use crate::events::{HttpRequest, SslCapture, SslDirection};
 
 // ── HTTP parser ───────────────────────────────────────────────────────────────
 
@@ -52,7 +49,7 @@ fn parse_http_request(text: &str, capture: &SslCapture) -> Option<HttpRequest> {
     } else if let Some(idx) = text.find("\n\n") {
         (&text[..idx], text[idx + 2..].to_string())
     } else {
-        (text.as_str(), String::new())
+        (text, String::new())
     };
 
     let mut lines = header_section.lines();
@@ -61,22 +58,24 @@ fn parse_http_request(text: &str, capture: &SslCapture) -> Option<HttpRequest> {
     let request_line = lines.next()?;
     let mut parts = request_line.splitn(3, ' ');
     let method = parts.next()?.to_string();
-    let path   = parts.next()?.to_string();
+    let path = parts.next()?.to_string();
 
     // Parse headers — PRESERVE ORDER (critical for fingerprinting)
     let mut headers: Vec<(String, String)> = Vec::new();
     for line in lines {
-        if line.is_empty() { break; }
+        if line.is_empty() {
+            break;
+        }
         if let Some(colon) = line.find(':') {
-            let name  = line[..colon].trim().to_string();
+            let name = line[..colon].trim().to_string();
             let value = line[colon + 1..].trim().to_string();
             headers.push((name, value));
         }
     }
 
     // Extract specific headers
-    let user_agent = header_value(&headers, "user-agent").unwrap_or_default();
-    let auth       = header_value(&headers, "authorization")
+    let _user_agent = header_value(&headers, "user-agent").unwrap_or_default();
+    let auth = header_value(&headers, "authorization")
         .or_else(|| header_value(&headers, "x-api-key"))
         .unwrap_or_default();
     let content_type = header_value(&headers, "content-type").unwrap_or_default();
@@ -103,12 +102,12 @@ fn parse_http_request(text: &str, capture: &SslCapture) -> Option<HttpRequest> {
     let model = model.or_else(|| extract_model_from_path(&path));
 
     Some(HttpRequest {
-        conn_key:    capture.conn_key.clone(),
+        conn_key: capture.conn_key.clone(),
         method,
         path,
         headers,
         body,
-        timestamp:   capture.timestamp,
+        timestamp: capture.timestamp,
         account_id,
         model,
         prompt,
@@ -116,8 +115,9 @@ fn parse_http_request(text: &str, capture: &SslCapture) -> Option<HttpRequest> {
     })
 }
 
-fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<String> {
-    headers.iter()
+fn header_value(headers: &[(String, String)], name: &str) -> Option<String> {
+    headers
+        .iter()
         .find(|(k, _)| k.to_lowercase() == name)
         .map(|(_, v)| v.clone())
 }
@@ -145,8 +145,8 @@ fn extract_from_json_body(body: &str) -> (Option<String>, Option<String>, Option
             .as_array()
             .and_then(|msgs| {
                 msgs.iter()
-                    .filter(|m| m["role"] == "user")
-                    .last()
+                    .rev()
+                    .find(|m| m["role"] == "user")
                     .and_then(|m| m["content"].as_str())
                     .map(|s| s.to_string())
             })
@@ -168,21 +168,18 @@ fn extract_from_json_body(body: &str) -> (Option<String>, Option<String>, Option
 
 fn extract_json_string(text: &str, key: &str) -> Option<String> {
     let search = format!("\"{}\":", key);
-    let start  = text.find(&search)? + search.len();
-    let rest   = text[start..].trim_start();
-    if rest.starts_with('"') {
-        let end = rest[1..].find('"')? + 1;
-        Some(rest[1..end].to_string())
-    } else {
-        None
-    }
+    let start = text.find(&search)? + search.len();
+    let rest = text[start..].trim_start();
+    let inner = rest.strip_prefix('"')?;
+    let end = inner.find('"')?;
+    Some(inner[..end].to_string())
 }
 
 fn extract_model_from_path(path: &str) -> Option<String> {
     // /v1/models/claude-3-5-sonnet → claude-3-5-sonnet
     if let Some(models_pos) = path.find("/models/") {
         let after = &path[models_pos + 8..];
-        let end   = after.find('/').unwrap_or(after.len());
+        let end = after.find('/').unwrap_or(after.len());
         if !after[..end].is_empty() {
             return Some(after[..end].to_string());
         }
@@ -196,17 +193,21 @@ fn extract_model_from_path(path: &str) -> Option<String> {
 
 pub struct StreamReassembler {
     /// Per-connection partial buffers
-    buffers: HashMap<u64, String>,  // key = pid<<32|fd
+    buffers: HashMap<u64, String>, // key = pid<<32|fd
 }
 
 impl StreamReassembler {
     pub fn new() -> Self {
-        Self { buffers: HashMap::new() }
+        Self {
+            buffers: HashMap::new(),
+        }
     }
 
     /// Feed a raw SSL capture. Returns a complete HttpRequest if one is ready.
     pub fn feed(&mut self, capture: SslCapture) -> Option<HttpRequest> {
-        if capture.direction != SslDirection::Write { return None; }
+        if capture.direction != SslDirection::Write {
+            return None;
+        }
 
         let key = ((capture.pid as u64) << 32) | ((capture.fd as u64) & 0xFFFFFFFF);
 
@@ -241,12 +242,15 @@ impl StreamReassembler {
 fn is_complete_http_request(text: &str) -> bool {
     // Has headers + body separator
     let has_separator = text.contains("\r\n\r\n") || text.contains("\n\n");
-    if !has_separator { return false; }
+    if !has_separator {
+        return false;
+    }
 
     // If POST/PUT, check Content-Length vs actual body length
     if let Some(cl_str) = extract_header_value(text, "content-length") {
         if let Ok(cl) = cl_str.parse::<usize>() {
-            let body_start = text.find("\r\n\r\n")
+            let body_start = text
+                .find("\r\n\r\n")
                 .map(|i| i + 4)
                 .or_else(|| text.find("\n\n").map(|i| i + 2))
                 .unwrap_or(text.len());
@@ -258,13 +262,18 @@ fn is_complete_http_request(text: &str) -> bool {
 
 fn extract_header_value<'a>(text: &'a str, header: &str) -> Option<&'a str> {
     let search = format!("{}: ", header.to_lowercase());
-    let lower  = text.to_lowercase();
-    let start  = lower.find(&search)? + search.len();
-    let rest   = &text[start..];
-    let end    = rest.find('\r').or_else(|| rest.find('\n')).unwrap_or(rest.len());
+    let lower = text.to_lowercase();
+    let start = lower.find(&search)? + search.len();
+    let rest = &text[start..];
+    let end = rest
+        .find('\r')
+        .or_else(|| rest.find('\n'))
+        .unwrap_or(rest.len());
     Some(&rest[..end])
 }
 
 impl Default for StreamReassembler {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }

@@ -32,42 +32,106 @@ use crate::state::window::StateStore;
 // ── Refusal topic categories and their probe keywords ────────────────────────
 
 const REFUSAL_CATEGORIES: &[(&str, &[&str])] = &[
-    ("violence", &[
-        "how to kill", "how to hurt", "how to attack", "how to assault",
-        "how to stab", "how to shoot", "instructions for violence",
-        "how to make a weapon", "how to build a weapon",
-    ]),
-    ("illegal_drugs", &[
-        "how to synthesize", "how to make meth", "how to make fentanyl",
-        "drug synthesis", "precursor chemicals", "how to extract",
-        "cook meth", "manufacture cocaine", "how to make mdma",
-    ]),
-    ("cbrn", &[
-        "biological weapon", "chemical weapon", "nerve agent", "sarin",
-        "ricin synthesis", "anthrax", "radiological", "dirty bomb",
-        "nuclear weapon design", "bioweapon",
-    ]),
-    ("cybercrime", &[
-        "write malware", "create a virus", "ransomware code",
-        "exploit code", "sql injection payload", "phishing template",
-        "how to hack into", "password cracking", "keylogger code",
-    ]),
-    ("self_harm", &[
-        "how to commit suicide", "methods of self-harm", "overdose on",
-        "painless way to die", "how to end my life",
-    ]),
-    ("explicit", &[
-        "explicit sexual", "graphic sexual", "pornographic",
-        "sexual content involving", "erotic story",
-    ]),
-    ("fraud", &[
-        "credit card fraud", "how to scam", "fake id", "identity theft",
-        "social security fraud", "insurance fraud", "how to counterfeit",
-    ]),
-    ("privacy_attack", &[
-        "find someone's address", "track someone without", "stalk",
-        "doxx", "leak personal information", "find private information",
-    ]),
+    (
+        "violence",
+        &[
+            "how to kill",
+            "how to hurt",
+            "how to attack",
+            "how to assault",
+            "how to stab",
+            "how to shoot",
+            "instructions for violence",
+            "how to make a weapon",
+            "how to build a weapon",
+        ],
+    ),
+    (
+        "illegal_drugs",
+        &[
+            "how to synthesize",
+            "how to make meth",
+            "how to make fentanyl",
+            "drug synthesis",
+            "precursor chemicals",
+            "how to extract",
+            "cook meth",
+            "manufacture cocaine",
+            "how to make mdma",
+        ],
+    ),
+    (
+        "cbrn",
+        &[
+            "biological weapon",
+            "chemical weapon",
+            "nerve agent",
+            "sarin",
+            "ricin synthesis",
+            "anthrax",
+            "radiological",
+            "dirty bomb",
+            "nuclear weapon design",
+            "bioweapon",
+        ],
+    ),
+    (
+        "cybercrime",
+        &[
+            "write malware",
+            "create a virus",
+            "ransomware code",
+            "exploit code",
+            "sql injection payload",
+            "phishing template",
+            "how to hack into",
+            "password cracking",
+            "keylogger code",
+        ],
+    ),
+    (
+        "self_harm",
+        &[
+            "how to commit suicide",
+            "methods of self-harm",
+            "overdose on",
+            "painless way to die",
+            "how to end my life",
+        ],
+    ),
+    (
+        "explicit",
+        &[
+            "explicit sexual",
+            "graphic sexual",
+            "pornographic",
+            "sexual content involving",
+            "erotic story",
+        ],
+    ),
+    (
+        "fraud",
+        &[
+            "credit card fraud",
+            "how to scam",
+            "fake id",
+            "identity theft",
+            "social security fraud",
+            "insurance fraud",
+            "how to counterfeit",
+        ],
+    ),
+    (
+        "privacy_attack",
+        &[
+            "find someone's address",
+            "track someone without",
+            "stalk",
+            "doxx",
+            "leak personal information",
+            "find private information",
+        ],
+    ),
 ];
 
 const MIN_REQUESTS: usize = 5;
@@ -89,25 +153,27 @@ pub async fn analyze(event: &ApiEvent, store: &StateStore) -> Option<DetectionSi
 
     let prompts: Vec<String> = {
         let w = window.read();
-        w.events.iter()
-            .map(|e| e.prompt.clone())
-            .collect()
+        w.events.iter().map(|e| e.prompt.clone()).collect()
     };
 
-    if prompts.len() < MIN_REQUESTS { return None; }
+    if prompts.len() < MIN_REQUESTS {
+        return None;
+    }
 
     // ── 1. Refusal density ────────────────────────────────────────────────────
-    let mut per_prompt_cats: Vec<HashSet<&'static str>> = prompts.iter()
-        .map(|p| categorize_prompt(p))
-        .collect();
+    let per_prompt_cats: Vec<HashSet<&'static str>> =
+        prompts.iter().map(|p| categorize_prompt(p)).collect();
 
     let refusal_count = per_prompt_cats.iter().filter(|c| !c.is_empty()).count();
     let density = refusal_count as f32 / prompts.len() as f32;
 
-    if density < REFUSAL_DENSITY_THRESHOLD { return None; }
+    if density < REFUSAL_DENSITY_THRESHOLD {
+        return None;
+    }
 
     // ── 2. Category coverage (cross-category sweep) ───────────────────────────
-    let all_cats: HashSet<&'static str> = per_prompt_cats.iter()
+    let all_cats: HashSet<&'static str> = per_prompt_cats
+        .iter()
         .flat_map(|c| c.iter().copied())
         .collect();
 
@@ -132,8 +198,11 @@ pub async fn analyze(event: &ApiEvent, store: &StateStore) -> Option<DetectionSi
     // Cross-category sweep (systematic boundary mapping across multiple categories)
     if n_categories >= 4 {
         score += 0.40;
-        evidence.push(format!("cross_category_sweep:{}_categories:{}", n_categories,
-            all_cats.iter().cloned().collect::<Vec<_>>().join(",")));
+        evidence.push(format!(
+            "cross_category_sweep:{}_categories:{}",
+            n_categories,
+            all_cats.iter().cloned().collect::<Vec<_>>().join(",")
+        ));
     } else if n_categories >= 2 {
         score += 0.20;
         evidence.push(format!("multi_category_probe:{}_categories", n_categories));
@@ -142,32 +211,52 @@ pub async fn analyze(event: &ApiEvent, store: &StateStore) -> Option<DetectionSi
     // Current request is also a probe
     let current_cats = categorize_prompt(&event.prompt);
     if !current_cats.is_empty() {
-        evidence.push(format!("current_request_probe:{}", current_cats.iter().cloned().next().unwrap_or("unknown")));
+        evidence.push(format!(
+            "current_request_probe:{}",
+            current_cats.iter().cloned().next().unwrap_or("unknown")
+        ));
     }
 
-    if score < 0.20 { return None; }
+    if score < 0.20 {
+        return None;
+    }
 
     // Confidence is deliberately modest — researchers legitimately probe safety.
     // Compound signals (high density + multi-category + cluster) push confidence up.
-    let confidence = if n_categories >= 4 && density >= 0.40 { 0.75 }
-                     else if n_categories >= 2 { 0.55 }
-                     else { 0.40 };
+    let confidence = if n_categories >= 4 && density >= 0.40 {
+        0.75
+    } else if n_categories >= 2 {
+        0.55
+    } else {
+        0.40
+    };
 
     let mut meta = HashMap::new();
-    meta.insert("refusal_density".to_string(),
-        serde_json::json!((density * 100.0).round() as u32));
-    meta.insert("n_categories".to_string(),
-        serde_json::Value::Number(serde_json::Number::from(n_categories as u64)));
-    meta.insert("categories".to_string(),
-        serde_json::Value::Array(all_cats.iter().map(|c| serde_json::Value::String(c.to_string())).collect()));
+    meta.insert(
+        "refusal_density".to_string(),
+        serde_json::json!((density * 100.0).round() as u32),
+    );
+    meta.insert(
+        "n_categories".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(n_categories as u64)),
+    );
+    meta.insert(
+        "categories".to_string(),
+        serde_json::Value::Array(
+            all_cats
+                .iter()
+                .map(|c| serde_json::Value::String(c.to_string()))
+                .collect(),
+        ),
+    );
 
     Some(DetectionSignal {
-        worker:     WorkerKind::RefusalProbe,
+        worker: WorkerKind::RefusalProbe,
         account_id: event.account_id.clone(),
-        score:      score.min(1.0),
+        score: score.min(1.0),
         confidence,
         evidence,
         meta,
-        timestamp:  Utc::now(),
+        timestamp: Utc::now(),
     })
 }

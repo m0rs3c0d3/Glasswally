@@ -1,5 +1,8 @@
 [workspace]
-members = ["glasswally", "glasswally-ebpf", "xtask"]
+members  = ["glasswally", "xtask"]
+# glasswally-ebpf is built separately: cargo xtask build-ebpf
+# It requires a BPF cross-compilation target and aya-bpf from git.
+exclude  = ["glasswally-ebpf"]
 resolver = "2"
 
 [workspace.package]
@@ -16,7 +19,7 @@ description = "Real-time LLM distillation attack detection via eBPF"
 tokio        = { version = "1",   features = ["full"] }
 
 # eBPF
-aya          = { version = "0.12", features = ["async_tokio"] }
+aya          = { version = "0.13", features = ["async_tokio"] }
 aya-log      = "0.2"
 
 # Serialization

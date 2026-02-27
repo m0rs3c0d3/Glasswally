@@ -11,10 +11,10 @@ pub mod velocity;
 pub mod watermark;
 // Phase 1 (new signals)
 pub mod asn_classifier;
+pub mod refusal_probe;
 pub mod role_preamble;
 pub mod session_gap;
 pub mod token_budget;
-pub mod refusal_probe;
 // Phase 3
 pub mod sequence_model;
 
@@ -24,10 +24,7 @@ use crate::state::window::StateStore;
 /// Run all 16 detection workers concurrently and collect their signals.
 /// Workers returning None (insufficient data / no signal) are silently dropped.
 pub async fn run_all(event: &ApiEvent, store: &StateStore) -> Vec<DetectionSignal> {
-    let (
-        fp, vel, cot_s, hyd, piv, wm, em, tc, h2, bio,
-        asn, role, gap, tok, ref_p, seq,
-    ) = tokio::join!(
+    let (fp, vel, cot_s, hyd, piv, wm, em, tc, h2, bio, asn, role, gap, tok, ref_p, seq) = tokio::join!(
         fingerprint::analyze(event, store),
         velocity::analyze(event, store),
         cot::analyze(event, store),
@@ -46,8 +43,10 @@ pub async fn run_all(event: &ApiEvent, store: &StateStore) -> Vec<DetectionSigna
         sequence_model::analyze(event, store),
     );
 
-    [fp, vel, cot_s, hyd, piv, wm, em, tc, h2, bio, asn, role, gap, tok, ref_p, seq]
-        .into_iter()
-        .flatten()
-        .collect()
+    [
+        fp, vel, cot_s, hyd, piv, wm, em, tc, h2, bio, asn, role, gap, tok, ref_p, seq,
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }

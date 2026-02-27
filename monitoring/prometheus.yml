@@ -1,0 +1,9 @@
+global:
+  scrape_interval:     5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: glasswally
+    static_configs:
+      - targets: ['glasswally:9090']
+    metrics_path: /metrics

@@ -29,48 +29,48 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use anyhow::Result;
-use tokio::net::TcpListener;
 use tokio::io::AsyncWriteExt;
+use tokio::net::TcpListener;
 use tracing::info;
 
-use crate::events::{DetectionSignal, RiskTier, WorkerKind};
+use crate::events::{DetectionSignal, RiskTier};
 
 // ── Metrics registry ──────────────────────────────────────────────────────────
 
 pub struct GlasswallMetrics {
-    pub events_processed:     AtomicU64,
-    pub alerts_critical:      AtomicU64,
-    pub alerts_high:          AtomicU64,
-    pub alerts_medium:        AtomicU64,
-    pub alerts_low:           AtomicU64,
-    pub shed_total:           AtomicU64,
-    pub kafka_published:      AtomicU64,
-    pub ioc_bundles:          AtomicU64,
-    pub canaries_triggered:   AtomicU64,
+    pub events_processed: AtomicU64,
+    pub alerts_critical: AtomicU64,
+    pub alerts_high: AtomicU64,
+    pub alerts_medium: AtomicU64,
+    pub alerts_low: AtomicU64,
+    pub shed_total: AtomicU64,
+    pub kafka_published: AtomicU64,
+    pub ioc_bundles: AtomicU64,
+    pub canaries_triggered: AtomicU64,
     /// Per-worker score sums + counts for mean score export
-    pub worker_score_sum:     std::sync::Mutex<HashMap<String, (f64, u64)>>,
+    pub worker_score_sum: std::sync::Mutex<HashMap<String, (f64, u64)>>,
     /// Composite score buckets [0.0, 0.1), [0.1, 0.2), ... [0.9, 1.0)
-    pub composite_buckets:    [AtomicU64; 10],
+    pub composite_buckets: [AtomicU64; 10],
 }
 
 impl GlasswallMetrics {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            events_processed:   AtomicU64::new(0),
-            alerts_critical:    AtomicU64::new(0),
-            alerts_high:        AtomicU64::new(0),
-            alerts_medium:      AtomicU64::new(0),
-            alerts_low:         AtomicU64::new(0),
-            shed_total:         AtomicU64::new(0),
-            kafka_published:    AtomicU64::new(0),
-            ioc_bundles:        AtomicU64::new(0),
+            events_processed: AtomicU64::new(0),
+            alerts_critical: AtomicU64::new(0),
+            alerts_high: AtomicU64::new(0),
+            alerts_medium: AtomicU64::new(0),
+            alerts_low: AtomicU64::new(0),
+            shed_total: AtomicU64::new(0),
+            kafka_published: AtomicU64::new(0),
+            ioc_bundles: AtomicU64::new(0),
             canaries_triggered: AtomicU64::new(0),
-            worker_score_sum:   std::sync::Mutex::new(HashMap::new()),
-            composite_buckets:  Default::default(),
+            worker_score_sum: std::sync::Mutex::new(HashMap::new()),
+            composite_buckets: Default::default(),
         })
     }
 
@@ -81,9 +81,9 @@ impl GlasswallMetrics {
     pub fn record_alert(&self, tier: RiskTier) {
         match tier {
             RiskTier::Critical => self.alerts_critical.fetch_add(1, Ordering::Relaxed),
-            RiskTier::High     => self.alerts_high.fetch_add(1, Ordering::Relaxed),
-            RiskTier::Medium   => self.alerts_medium.fetch_add(1, Ordering::Relaxed),
-            RiskTier::Low      => self.alerts_low.fetch_add(1, Ordering::Relaxed),
+            RiskTier::High => self.alerts_high.fetch_add(1, Ordering::Relaxed),
+            RiskTier::Medium => self.alerts_medium.fetch_add(1, Ordering::Relaxed),
+            RiskTier::Low => self.alerts_low.fetch_add(1, Ordering::Relaxed),
         };
     }
 
@@ -122,40 +122,62 @@ impl GlasswallMetrics {
             };
         }
 
-        counter!("glasswally_events_processed_total",
+        counter!(
+            "glasswally_events_processed_total",
             "Total API events ingested",
-            self.events_processed.load(Ordering::Relaxed));
+            self.events_processed.load(Ordering::Relaxed)
+        );
 
         out.push_str("# HELP glasswally_alerts_total Total alerts by risk tier\n");
         out.push_str("# TYPE glasswally_alerts_total counter\n");
-        out.push_str(&format!("glasswally_alerts_total{{tier=\"critical\"}} {}\n",
-            self.alerts_critical.load(Ordering::Relaxed)));
-        out.push_str(&format!("glasswally_alerts_total{{tier=\"high\"}} {}\n",
-            self.alerts_high.load(Ordering::Relaxed)));
-        out.push_str(&format!("glasswally_alerts_total{{tier=\"medium\"}} {}\n",
-            self.alerts_medium.load(Ordering::Relaxed)));
-        out.push_str(&format!("glasswally_alerts_total{{tier=\"low\"}} {}\n",
-            self.alerts_low.load(Ordering::Relaxed)));
+        out.push_str(&format!(
+            "glasswally_alerts_total{{tier=\"critical\"}} {}\n",
+            self.alerts_critical.load(Ordering::Relaxed)
+        ));
+        out.push_str(&format!(
+            "glasswally_alerts_total{{tier=\"high\"}} {}\n",
+            self.alerts_high.load(Ordering::Relaxed)
+        ));
+        out.push_str(&format!(
+            "glasswally_alerts_total{{tier=\"medium\"}} {}\n",
+            self.alerts_medium.load(Ordering::Relaxed)
+        ));
+        out.push_str(&format!(
+            "glasswally_alerts_total{{tier=\"low\"}} {}\n",
+            self.alerts_low.load(Ordering::Relaxed)
+        ));
 
-        gauge!("glasswally_accounts_active",
+        gauge!(
+            "glasswally_accounts_active",
             "Current active account windows in StateStore",
-            store_accounts);
-        gauge!("glasswally_clusters_active",
+            store_accounts
+        );
+        gauge!(
+            "glasswally_clusters_active",
             "Current active clusters in StateStore",
-            store_clusters);
+            store_clusters
+        );
 
-        counter!("glasswally_shed_total",
+        counter!(
+            "glasswally_shed_total",
             "Events dropped by load shedder",
-            self.shed_total.load(Ordering::Relaxed));
-        counter!("glasswally_kafka_published_total",
+            self.shed_total.load(Ordering::Relaxed)
+        );
+        counter!(
+            "glasswally_kafka_published_total",
             "Messages published to Kafka",
-            self.kafka_published.load(Ordering::Relaxed));
-        counter!("glasswally_ioc_bundles_published_total",
+            self.kafka_published.load(Ordering::Relaxed)
+        );
+        counter!(
+            "glasswally_ioc_bundles_published_total",
             "IOC bundles published to feed",
-            self.ioc_bundles.load(Ordering::Relaxed));
-        counter!("glasswally_canaries_triggered_total",
+            self.ioc_bundles.load(Ordering::Relaxed)
+        );
+        counter!(
+            "glasswally_canaries_triggered_total",
             "Canary tokens triggered (distillation confirmed)",
-            self.canaries_triggered.load(Ordering::Relaxed));
+            self.canaries_triggered.load(Ordering::Relaxed)
+        );
 
         // Per-worker mean score
         out.push_str("# HELP glasswally_worker_mean_score Mean detection score per worker\n");
@@ -164,7 +186,8 @@ impl GlasswallMetrics {
             for (worker, (sum, count)) in map.iter() {
                 let mean = if *count > 0 { sum / *count as f64 } else { 0.0 };
                 out.push_str(&format!(
-                    "glasswally_worker_mean_score{{worker=\"{}\"}} {:.4}\n", worker, mean
+                    "glasswally_worker_mean_score{{worker=\"{}\"}} {:.4}\n",
+                    worker, mean
                 ));
             }
         }
@@ -187,8 +210,8 @@ impl GlasswallMetrics {
 // ── HTTP /metrics endpoint ─────────────────────────────────────────────────────
 
 pub struct MetricsServer {
-    pub metrics:  Arc<GlasswallMetrics>,
-    addr:         SocketAddr,
+    pub metrics: Arc<GlasswallMetrics>,
+    addr: SocketAddr,
 }
 
 impl MetricsServer {
@@ -206,7 +229,7 @@ impl MetricsServer {
         loop {
             let (mut stream, _) = listener.accept().await?;
             let metrics = Arc::clone(&self.metrics);
-            let store   = Arc::clone(&store);
+            let store = Arc::clone(&store);
 
             tokio::spawn(async move {
                 let body = metrics.prometheus_text(store.n_accounts(), store.n_clusters());

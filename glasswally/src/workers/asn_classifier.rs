@@ -36,33 +36,79 @@ use crate::state::window::StateStore;
 // ── Known cloud / datacenter ASN org name prefixes (lowercased) ───────────────
 // Tier 1 — major cloud providers (high volume legitimate use too, lower risk weight)
 const CLOUD_TIER1: &[&str] = &[
-    "amazon", "aws", "google", "gcp", "microsoft", "azure",
-    "alibaba", "tencent cloud", "oracle cloud",
+    "amazon",
+    "aws",
+    "google",
+    "gcp",
+    "microsoft",
+    "azure",
+    "alibaba",
+    "tencent cloud",
+    "oracle cloud",
 ];
 
 // Tier 2 — VPS / dedicated server / bulk hosters (lower legitimate use, higher risk)
 const CLOUD_TIER2: &[&str] = &[
-    "digitalocean", "linode", "akamai", "vultr", "choopa", "hetzner",
-    "ovh", "ovhcloud", "online s.a.s", "scaleway", "contabo", "leaseweb",
-    "cogent", "hurricane electric", "quadranet", "fiberhub",
-    "frantech", "buyvm", "m247", "serverius", "serverastra",
-    "datacamp", "hostwinds", "dreamhost", "interserver",
+    "digitalocean",
+    "linode",
+    "akamai",
+    "vultr",
+    "choopa",
+    "hetzner",
+    "ovh",
+    "ovhcloud",
+    "online s.a.s",
+    "scaleway",
+    "contabo",
+    "leaseweb",
+    "cogent",
+    "hurricane electric",
+    "quadranet",
+    "fiberhub",
+    "frantech",
+    "buyvm",
+    "m247",
+    "serverius",
+    "serverastra",
+    "datacamp",
+    "hostwinds",
+    "dreamhost",
+    "interserver",
 ];
 
 // Tier 3 — Bulletproof / known abuse-friendly hosters
 const CLOUD_TIER3: &[&str] = &[
-    "sharktech", "colocation america", "krypt", "tzulo", "fdcservers",
-    "psychz", "spinservers", "servermania", "nexeon", "path network",
+    "sharktech",
+    "colocation america",
+    "krypt",
+    "tzulo",
+    "fdcservers",
+    "psychz",
+    "spinservers",
+    "servermania",
+    "nexeon",
+    "path network",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CloudTier { None, Major, Vps, Bulletproof }
+enum CloudTier {
+    None,
+    Major,
+    Vps,
+    Bulletproof,
+}
 
 fn classify_asn_org(org: &str) -> CloudTier {
     let lower = org.to_lowercase();
-    if CLOUD_TIER3.iter().any(|&p| lower.contains(p)) { return CloudTier::Bulletproof; }
-    if CLOUD_TIER2.iter().any(|&p| lower.contains(p)) { return CloudTier::Vps; }
-    if CLOUD_TIER1.iter().any(|&p| lower.contains(p)) { return CloudTier::Major; }
+    if CLOUD_TIER3.iter().any(|&p| lower.contains(p)) {
+        return CloudTier::Bulletproof;
+    }
+    if CLOUD_TIER2.iter().any(|&p| lower.contains(p)) {
+        return CloudTier::Vps;
+    }
+    if CLOUD_TIER1.iter().any(|&p| lower.contains(p)) {
+        return CloudTier::Major;
+    }
     CloudTier::None
 }
 
@@ -100,11 +146,15 @@ pub async fn analyze(event: &ApiEvent, store: &StateStore) -> Option<DetectionSi
             for member in &members {
                 if let Some(w) = store.get_window(member) {
                     let w = w.read();
-                    if let Some(org) = w.events.last().and_then(|e| e.asn_org.as_deref()) {
+                    if let Some(org) = w.events.back().and_then(|e| e.asn_org.as_deref()) {
                         if classify_asn_org(org) != CloudTier::None {
                             cloud_count += 1;
                             // Aggregate provider name (first word)
-                            let provider = org.split_whitespace().next().unwrap_or("unknown").to_lowercase();
+                            let provider = org
+                                .split_whitespace()
+                                .next()
+                                .unwrap_or("unknown")
+                                .to_lowercase();
                             *provider_counts.entry(provider).or_default() += 1;
                         }
                     }
@@ -114,42 +164,59 @@ pub async fn analyze(event: &ApiEvent, store: &StateStore) -> Option<DetectionSi
             let cloud_frac = cloud_count as f32 / members.len() as f32;
             if cloud_frac >= 0.60 {
                 score += 0.40;
-                evidence.push(format!("cloud_cluster:{:.0}%_cloud_asn", cloud_frac * 100.0));
+                evidence.push(format!(
+                    "cloud_cluster:{:.0}%_cloud_asn",
+                    cloud_frac * 100.0
+                ));
 
                 // Extra signal: all on same provider
                 if let Some((provider, cnt)) = provider_counts.iter().max_by_key(|e| *e.1) {
                     if *cnt as f32 / members.len() as f32 >= 0.70 {
                         score += 0.10;
-                        evidence.push(format!("single_cloud_provider:{}:{}_accounts", provider, cnt));
+                        evidence.push(format!(
+                            "single_cloud_provider:{}:{}_accounts",
+                            provider, cnt
+                        ));
                     }
                 }
             }
         }
     }
 
-    if score < 0.15 { return None; }
+    if score < 0.15 {
+        return None;
+    }
 
     let confidence = match tier {
         CloudTier::Bulletproof => 0.90,
-        CloudTier::Vps        => 0.80,
-        CloudTier::Major      => 0.60,
-        CloudTier::None       => 0.70, // cluster-only signal
+        CloudTier::Vps => 0.80,
+        CloudTier::Major => 0.60,
+        CloudTier::None => 0.70, // cluster-only signal
     };
 
     let mut meta = HashMap::new();
     if let Some(asn) = event.asn_number {
-        meta.insert("asn".to_string(), serde_json::Value::Number(serde_json::Number::from(asn as u64)));
+        meta.insert(
+            "asn".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(asn as u64)),
+        );
     }
-    meta.insert("asn_org".to_string(), serde_json::Value::String(asn_org.to_string()));
-    meta.insert("cloud_tier".to_string(), serde_json::Value::String(format!("{:?}", tier)));
+    meta.insert(
+        "asn_org".to_string(),
+        serde_json::Value::String(asn_org.to_string()),
+    );
+    meta.insert(
+        "cloud_tier".to_string(),
+        serde_json::Value::String(format!("{:?}", tier)),
+    );
 
     Some(DetectionSignal {
-        worker:     WorkerKind::AsnClassifier,
+        worker: WorkerKind::AsnClassifier,
         account_id: event.account_id.clone(),
-        score:      score.min(1.0),
+        score: score.min(1.0),
         confidence,
         evidence,
         meta,
-        timestamp:  Utc::now(),
+        timestamp: Utc::now(),
     })
 }

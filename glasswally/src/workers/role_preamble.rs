@@ -80,7 +80,13 @@ fn preamble_hash(prompt: &str) -> String {
     let normalised: String = prompt
         .chars()
         .take(512)
-        .map(|c| if c.is_ascii_alphanumeric() || c == ' ' { c.to_ascii_lowercase() } else { ' ' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == ' ' {
+                c.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
         .collect();
     let normalised = normalised.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut h = Sha256::new();
@@ -120,15 +126,25 @@ pub async fn analyze(event: &ApiEvent, store: &StateStore) -> Option<DetectionSi
     let window = store.get_window(&event.account_id)?;
     let preamble_hashes: Vec<String> = {
         let w = window.read();
-        w.events.iter()
+        w.events
+            .iter()
             .filter_map(|e| e.system_prompt_hash.clone())
             .collect()
     };
 
     let reuse_score = if preamble_hashes.len() >= 5 {
-        let same = preamble_hashes.iter().filter(|h| *h == &preamble_src).count();
+        let same = preamble_hashes
+            .iter()
+            .filter(|h| *h == &preamble_src)
+            .count();
         let frac = same as f32 / preamble_hashes.len() as f32;
-        if frac >= 0.80 { 0.35 } else if frac >= 0.60 { 0.20 } else { 0.0 }
+        if frac >= 0.80 {
+            0.35
+        } else if frac >= 0.60 {
+            0.20
+        } else {
+            0.0
+        }
     } else {
         0.0
     };
@@ -136,26 +152,43 @@ pub async fn analyze(event: &ApiEvent, store: &StateStore) -> Option<DetectionSi
     // ── 3. Cross-account preamble collision ───────────────────────────────────
     let collision_score = {
         let n = store.accounts_with_preamble_hash(&preamble_src);
-        if n >= 10 { 0.50 }
-        else if n >= 5 { 0.35 }
-        else if n >= 3 { 0.18 }
-        else { 0.0 }
+        if n >= 10 {
+            0.50
+        } else if n >= 5 {
+            0.35
+        } else if n >= 3 {
+            0.18
+        } else {
+            0.0
+        }
     };
 
     // ── 4. Task chaining in preamble (ends with explicit task list) ───────────
     let chain_score = if prompt_lower.contains("task 1:")
         || prompt_lower.contains("step 1:")
         || prompt_lower.contains("question 1:")
-        || (prompt_lower.contains("first,") && prompt_lower.contains("then,") && prompt_lower.contains("finally,"))
-    { 0.15 } else { 0.0 };
+        || (prompt_lower.contains("first,")
+            && prompt_lower.contains("then,")
+            && prompt_lower.contains("finally,"))
+    {
+        0.15
+    } else {
+        0.0
+    };
 
     let total = archetype_score + reuse_score + collision_score + chain_score;
-    if total < 0.15 { return None; }
+    if total < 0.15 {
+        return None;
+    }
 
-    let score    = total.min(1.0);
-    let confidence = if collision_score > 0.0 { 0.90 }
-                     else if reuse_score > 0.0  { 0.75 }
-                     else { 0.55 };
+    let score = total.min(1.0);
+    let confidence = if collision_score > 0.0 {
+        0.90
+    } else if reuse_score > 0.0 {
+        0.75
+    } else {
+        0.55
+    };
 
     let mut evidence = Vec::new();
     if archetype_score > 0.0 {
@@ -174,18 +207,22 @@ pub async fn analyze(event: &ApiEvent, store: &StateStore) -> Option<DetectionSi
     }
 
     let mut meta = HashMap::new();
-    meta.insert("preamble_hash".to_string(),
-        serde_json::Value::String(preamble_src));
-    meta.insert("archetype_hits".to_string(),
-        serde_json::Value::Number(serde_json::Number::from(archetype_hits.len() as u64)));
+    meta.insert(
+        "preamble_hash".to_string(),
+        serde_json::Value::String(preamble_src),
+    );
+    meta.insert(
+        "archetype_hits".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(archetype_hits.len() as u64)),
+    );
 
     Some(DetectionSignal {
-        worker:     WorkerKind::RolePreamble,
+        worker: WorkerKind::RolePreamble,
         account_id: event.account_id.clone(),
         score,
         confidence,
         evidence,
         meta,
-        timestamp:  Utc::now(),
+        timestamp: Utc::now(),
     })
 }

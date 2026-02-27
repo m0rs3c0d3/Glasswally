@@ -1,0 +1,25 @@
+[package]
+name        = "glasswally-ebpf"
+version.workspace  = true
+edition.workspace  = true
+license.workspace  = true
+authors.workspace  = true
+repository.workspace = true
+description = "Glasswally eBPF kernel programs — ssl uprobes + tcp kprobe"
+
+[[bin]]
+name = "glasswally-ebpf"
+path = "src/main.rs"
+
+[dependencies]
+aya-bpf      = "0.1"
+aya-log-ebpf = "0.1"
+
+[profile.dev]
+opt-level = 2
+panic     = "abort"
+
+[profile.release]
+opt-level = 2
+panic     = "abort"
+lto       = true

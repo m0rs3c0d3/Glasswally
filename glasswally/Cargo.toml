@@ -1,0 +1,36 @@
+[package]
+name        = "glasswally"
+version.workspace   = true
+edition.workspace   = true
+license.workspace   = true
+authors.workspace   = true
+repository.workspace = true
+description = "Glasswally userspace — real-time LLM distillation detection daemon"
+
+[features]
+live-ebpf = []   # enables embedding compiled BPF bytecode
+
+[[bin]]
+name = "glasswally"
+path = "src/main.rs"
+
+[dependencies]
+tokio              = { workspace = true }
+aya                = { workspace = true }
+aya-log            = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+dashmap            = { workspace = true }
+parking_lot        = { workspace = true }
+aho-corasick       = { workspace = true }
+md5                = { workspace = true }
+hex                = { workspace = true }
+sha2               = { workspace = true }
+petgraph           = { workspace = true }
+clap               = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono             = { workspace = true }
+anyhow             = { workspace = true }
+thiserror          = { workspace = true }
+bytes              = "1"

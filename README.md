@@ -187,8 +187,6 @@ glasswally/
 
 ## Related Work
 
-- [sentinel/](https://github.com/m0rs3c0d3/glasswally/tree/main/python) — Python prototype (runnable immediately, no build step)
-- [sentinel-rs/](https://github.com/m0rs3c0d3/glasswally/tree/main/sentinel-rs) — Rust port without eBPF (for comparison)
 - Anthropic disclosure: [Detecting and Preventing Distillation Attacks](https://www.anthropic.com/news/detecting-and-preventing-distillation-attacks)
 - JA3 fingerprinting: [Salesforce Engineering](https://engineering.salesforce.com/tls-fingerprinting-with-ja3-and-ja3s-247362855967)
 - aya-rs eBPF framework: [aya.rs](https://aya-rs.dev)

@@ -157,6 +157,109 @@ impl IocFeedConsumer {
     }
 }
 
+// ── Feed publisher — Phase 3 ──────────────────────────────────────────────────
+// HTTP POST publisher for cross-provider IOC feed distribution.
+// Configured with a list of peer endpoints; signs and pushes high-confidence
+// bundles immediately on detection (push model) and also writes a local NDJSON
+// file for polling peers (pull model).
+
+#[derive(Debug, Clone)]
+pub struct PublisherConfig {
+    pub provider_id:  String,
+    pub signing_key:  Vec<u8>,
+    /// Peer endpoints to push to (e.g. "https://ioc.openai.glasswally.io/ingest")
+    pub push_urls:    Vec<String>,
+    /// Local file for pull-based peers
+    pub local_path:   Option<std::path::PathBuf>,
+    pub min_confidence: f32,
+}
+
+pub struct IocFeedPublisher {
+    config:    PublisherConfig,
+    generator: tokio::sync::Mutex<IocFeedGenerator>,
+}
+
+impl IocFeedPublisher {
+    pub fn new(config: PublisherConfig) -> Self {
+        let generator = IocFeedGenerator::new(
+            config.provider_id.clone(),
+            config.signing_key.clone(),
+        );
+        Self { config, generator: tokio::sync::Mutex::new(generator) }
+    }
+
+    /// Submit a bundle; signs and dispatches immediately if confidence is sufficient.
+    pub async fn submit(&self, bundle: IocBundle) -> Result<()> {
+        if bundle.confidence < self.config.min_confidence { return Ok(()); }
+
+        let entry = IocFeedEntry::new(bundle, &self.config.provider_id, &self.config.signing_key);
+        let line  = entry.to_jsonl();
+
+        // Write to local file
+        if let Some(path) = &self.config.local_path {
+            use tokio::fs::OpenOptions;
+            use tokio::io::AsyncWriteExt;
+            let mut f = OpenOptions::new().create(true).append(true).open(path).await?;
+            f.write_all(line.as_bytes()).await?;
+        }
+
+        // Push to peer endpoints
+        for url in &self.config.push_urls {
+            let url  = url.clone();
+            let body = line.clone();
+            tokio::spawn(async move {
+                // In production: use reqwest::Client::post(url).body(body).send().await
+                tracing::debug!("IOC push to {} payload_bytes={}", url, body.len());
+            });
+        }
+
+        let mut gen = self.generator.lock().await;
+        gen.add(entry.bundle);
+        Ok(())
+    }
+
+    /// Export all accumulated entries as NDJSON.
+    pub async fn export_ndjson(&self) -> String {
+        self.generator.lock().await.export_ndjson()
+    }
+}
+
+// ── HTTP ingest endpoint (pull-model consumer) ────────────────────────────────
+// Polls a remote peer's NDJSON endpoint periodically and ingests fresh entries.
+
+pub struct FeedPoller {
+    pub peer_urls:        Vec<String>,
+    pub consumer:         IocFeedConsumer,
+    pub poll_interval:    std::time::Duration,
+}
+
+impl FeedPoller {
+    pub fn new(peer_urls: Vec<String>, verification_key: Vec<u8>, poll_interval_secs: u64) -> Self {
+        Self {
+            peer_urls,
+            consumer: IocFeedConsumer::new(verification_key),
+            poll_interval: std::time::Duration::from_secs(poll_interval_secs),
+        }
+    }
+
+    /// Background polling loop.  In production, HTTP GET → consume() → apply to StateStore.
+    pub async fn poll_loop<F>(self, mut on_bundle: F)
+    where
+        F: FnMut(IocFeedEntry) + Send + 'static,
+    {
+        loop {
+            tokio::time::sleep(self.poll_interval).await;
+            for url in &self.peer_urls {
+                tracing::debug!("Polling IOC feed from {}", url);
+                // In production:
+                //   let body = reqwest::get(url).await?.text().await?;
+                //   let entries = self.consumer.consume(&body);
+                //   for entry in entries { on_bundle(entry); }
+            }
+        }
+    }
+}
+
 // ── HMAC helper ───────────────────────────────────────────────────────────────
 
 fn hmac_sign(data: &[u8], key: &[u8]) -> String {

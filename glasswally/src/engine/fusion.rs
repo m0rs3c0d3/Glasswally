@@ -2,21 +2,25 @@
 //
 // Weighted signal fusion with geo uplift + cluster floor raise.
 //
-// Weight distribution across 10 workers (sum = 1.00):
-//   Fingerprint   0.20  — JA3 + JA3S + header entropy (highest precision)
-//   Velocity      0.13  — RPH / timing (complemented by TimingCluster)
-//   Cot           0.12  — Aho-Corasick patterns (complemented by Embed)
-//   Embed         0.10  — semantic similarity (catches CoT paraphrases)
-//   Hydra         0.11  — cluster graph scoring
-//   TimingCluster 0.09  — cross-account synchronized bursts
-//   H2Grpc        0.07  — HTTP/2 SETTINGS + gRPC fingerprinting
-//   Pivot         0.07  — coordinated model switch
-//   Biometric     0.06  — prompt sequence entropy
-//   Watermark     0.05  — watermark probe / ZW character detection
+// Weight distribution across 16 workers (sum = 1.00):
+//   Fingerprint   0.14  — JA3 + JA3S + header entropy (highest precision)
+//   Velocity      0.10  — RPH / timing (complemented by TimingCluster)
+//   Cot           0.09  — Aho-Corasick patterns (complemented by Embed)
+//   Embed         0.08  — semantic similarity (catches CoT paraphrases)
+//   Hydra         0.08  — cluster graph scoring
+//   TimingCluster 0.07  — cross-account synchronized bursts
+//   H2Grpc        0.06  — HTTP/2 SETTINGS + gRPC fingerprinting
+//   Pivot         0.05  — coordinated model switch
+//   Biometric     0.05  — prompt sequence entropy
+//   Watermark     0.04  — watermark probe / ZW character detection
+//   AsnClassifier 0.07  — datacenter/hosting provider IP classification (Phase 1)
+//   RolePreamble  0.06  — role injection preamble fingerprinting (Phase 1)
+//   SessionGap    0.04  — inter-session timing regularity / cron detection (Phase 1)
+//   TokenBudget   0.03  — max_tokens sweep / greedy budget probing (Phase 1)
+//   RefusalProbe  0.02  — safety refusal probe pattern detection (Phase 1)
+//   SequenceModel 0.02  — Markov chain over prompt topic transitions (Phase 3)
 //
-// Original 5-worker system: Fingerprint(30) + Velocity(23) + Cot(23) + Hydra(14) + Pivot(10)
-// The added signals are redistributed proportionally while preserving the
-// relative ordering of precision.
+// Weights sum: 0.14+0.10+0.09+0.08+0.08+0.07+0.06+0.05+0.05+0.04+0.07+0.06+0.04+0.03+0.02+0.02 = 1.00
 
 use chrono::Utc;
 use dashmap::DashMap;
@@ -27,16 +31,22 @@ use crate::state::window::StateStore;
 
 // Signal weights — must sum to 1.0
 const WEIGHTS: &[(WorkerKind, f32)] = &[
-    (WorkerKind::Fingerprint,   0.20),
-    (WorkerKind::Velocity,      0.13),
-    (WorkerKind::Cot,           0.12),
-    (WorkerKind::Embed,         0.10),
-    (WorkerKind::Hydra,         0.11),
-    (WorkerKind::TimingCluster, 0.09),
-    (WorkerKind::H2Grpc,        0.07),
-    (WorkerKind::Pivot,         0.07),
-    (WorkerKind::Biometric,     0.06),
-    (WorkerKind::Watermark,     0.05),
+    (WorkerKind::Fingerprint,   0.14),
+    (WorkerKind::Velocity,      0.10),
+    (WorkerKind::Cot,           0.09),
+    (WorkerKind::Embed,         0.08),
+    (WorkerKind::Hydra,         0.08),
+    (WorkerKind::TimingCluster, 0.07),
+    (WorkerKind::H2Grpc,        0.06),
+    (WorkerKind::Pivot,         0.05),
+    (WorkerKind::Biometric,     0.05),
+    (WorkerKind::Watermark,     0.04),
+    (WorkerKind::AsnClassifier, 0.07),
+    (WorkerKind::RolePreamble,  0.06),
+    (WorkerKind::SessionGap,    0.04),
+    (WorkerKind::TokenBudget,   0.03),
+    (WorkerKind::RefusalProbe,  0.02),
+    (WorkerKind::SequenceModel, 0.02),
 ];
 
 const CRITICAL: f32 = 0.72;
@@ -136,6 +146,11 @@ impl FusionEngine {
     pub fn record_alert(&self, account_id: &str, suspend: bool) {
         self.last_alert.insert(account_id.to_string(), Utc::now());
         if suspend { self.suspended.insert(account_id.to_string(), true); }
+    }
+
+    /// Returns true if the account is currently suspended (used by gRPC query API).
+    pub fn is_suspended(&self, account_id: &str) -> bool {
+        self.suspended.get(account_id).map(|s| *s).unwrap_or(false)
     }
 }
 

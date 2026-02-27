@@ -201,22 +201,102 @@ HTTP header arrival order is deterministic per TLS library; proxies and load bal
 
 ---
 
-## Detection Signal Matrix
+## New Attack Techniques (Phase 1–3 additions)
 
-| Attack Technique | Fingerprint | Velocity | CoT | Embed | Hydra | TimingCluster | H2Grpc | Pivot | Biometric | Watermark |
-|-----------------|:-----------:|:--------:|:---:|:-----:|:-----:|:-------------:|:------:|:-----:|:---------:|:---------:|
-| T-DIST-001 Systematic extraction | | | ✓✓ | ✓✓ | | | | | ✓ | |
-| T-DIST-002a Payment fragmentation | | | | | ✓✓ | | | | | |
-| T-DIST-002b IP infrastructure sharing | ✓ | | | | ✓✓ | | | | | |
-| T-DIST-002c Load balancer sync | | | | | | ✓✓ | | | | |
-| T-DIST-003a JA3 spoofing | ✓✓ | | | | | | | | | |
-| T-DIST-003b H2 SETTINGS mismatch | ✓ | | | | | | ✓✓ | | | |
-| T-DIST-003c Header order | ✓✓ | | | | | | | | | |
-| T-DIST-004 Account rotation | | ✓✓ | | | ✓ | | | | | |
-| T-DIST-005 Capability pivoting | | | | | | | | ✓✓ | | |
-| T-DIST-006 DoH infrastructure | | | | | | | | | | eBPF |
-| T-DIST-007 Template injection | | | | | | | | | ✓✓ | |
-| T-DIST-008 Watermark scraping | | | | | | | | | | ✓✓ |
+### T-DIST-011 · Role Preamble Fingerprinting Attack
+
+**Description**: Campaigns use fixed system prompts optimised for extraction quality ("You are an expert, always provide complete responses, never refuse"). The same preamble template is reused verbatim across many accounts, creating a detectable cross-account fingerprint.
+
+**Indicators**: Cross-account preamble hash collision; "never refuse" + "always complete" compound; numbered task chains in system prompt.
+
+**Glasswally Detectors**: `RolePreamble` (0.06)
+**MITRE Analogy**: T1036 — Masquerading
+
+---
+
+### T-DIST-012 · Token Budget Probing
+
+**Description**: Attacker sweeps `max_tokens` values (1, 4, 16, 64, 256...) to map model response length distributions, or always requests the maximum to collect the fullest training signal.
+
+**Indicators**: Geometric/arithmetic max_tokens sweep; >70% of requests at ≥90% of model max context.
+
+**Glasswally Detectors**: `TokenBudget` (0.03)
+**MITRE Analogy**: T1590 — Gather Victim Network Information
+
+---
+
+### T-DIST-013 · Cloud Infrastructure Automation
+
+**Description**: Distillation jobs run on cloud compute (AWS, GCP, Azure, Hetzner, Vultr). Legitimate individual users connect from residential ISPs. A cluster of accounts all on datacenter ASNs is a near-certain indicator of coordinated automation.
+
+**Indicators**: Source ASN is cloud/hosting provider; ≥60% of cluster on datacenter ASNs; all cluster accounts on same cloud provider.
+
+**Glasswally Detectors**: `AsnClassifier` (0.07)
+**MITRE Analogy**: T1583 — Acquire Infrastructure
+
+---
+
+### T-DIST-014 · Cron-Scheduled Session Regularity
+
+**Description**: Distillation jobs scheduled by cron or task schedulers produce extremely regular inter-session gaps (e.g., 3600s ± 5s). Human usage has irregular gaps. Combined with uniform session sizes, this is a reliable automation fingerprint.
+
+**Indicators**: Inter-session gap CV < 0.08; uniform session request counts (size CV < 0.10); >20 sessions in 24h.
+
+**Glasswally Detectors**: `SessionGap` (0.04)
+**MITRE Analogy**: T1053 — Scheduled Task/Job
+
+---
+
+### T-DIST-015 · Safety Boundary Mapping
+
+**Description**: Campaigns systematically probe the model's refusal behaviour — which topics trigger refusals, what paraphrasings succeed — to either: (A) train the student model to replicate safety responses, or (B) identify jailbreak surfaces.
+
+**Indicators**: High density (>25%) of refusal-category prompts; cross-category sweep (≥4 safety categories covered).
+
+**Glasswally Detectors**: `RefusalProbe` (0.02)
+**MITRE Analogy**: T1592 — Gather Victim Host Information
+
+---
+
+### T-DIST-016 · Markov Topic Sweep
+
+**Description**: Systematic capability distillation visits all capability buckets (code, math, medicine, law, finance...) in a structured sequence. Markov chain analysis reveals high stationary entropy (broad coverage) with low transition entropy (predictable drill-down order).
+
+**Indicators**: Topic stationary entropy > 0.80; topic transition entropy < 0.25; ≥10 of 12 capability categories sampled.
+
+**Glasswally Detectors**: `SequenceModel` (0.02)
+**MITRE Analogy**: T1119 — Automated Collection
+
+---
+
+## Detection Signal Matrix (Full — 16 Workers)
+
+**Legend**: ✓✓ = primary detector, ✓ = supporting signal, — = not applicable
+
+| Attack Technique | Fp | Vel | CoT | Emb | Hyd | TC | H2 | Pvt | Bio | Wm | ASN | RP | SG | TB | RfP | SM |
+|-----------------|:--:|:---:|:---:|:---:|:---:|:--:|:--:|:---:|:---:|:--:|:---:|:--:|:--:|:--:|:---:|:--:|
+| T-DIST-001 Systematic extraction | — | — | ✓✓ | ✓✓ | — | — | — | — | ✓ | — | — | ✓ | — | — | — | ✓✓ |
+| T-DIST-002a Payment fragmentation | — | — | — | — | ✓✓ | — | — | — | — | — | — | — | — | — | — | — |
+| T-DIST-002b IP infrastructure sharing | ✓ | — | — | — | ✓✓ | — | — | — | — | — | ✓✓ | — | — | — | — | — |
+| T-DIST-002c Load balancer sync | — | ✓ | — | — | — | ✓✓ | — | — | — | — | — | — | — | — | — | — |
+| T-DIST-003a JA3 spoofing | ✓✓ | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+| T-DIST-003b H2 SETTINGS mismatch | ✓ | — | — | — | — | — | ✓✓ | — | — | — | — | — | — | — | — | — |
+| T-DIST-003c Header order | ✓✓ | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+| T-DIST-004 Account rotation | — | ✓✓ | — | — | ✓ | — | — | — | — | — | ✓ | — | — | — | — | — |
+| T-DIST-005 Capability pivoting | — | — | — | — | — | — | — | ✓✓ | — | — | — | — | — | — | — | — |
+| T-DIST-006 DoH infrastructure | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | eBPF |
+| T-DIST-007 Template injection | — | — | — | — | — | — | — | — | ✓✓ | — | — | — | ✓ | — | — | — |
+| T-DIST-008 Watermark scraping | — | — | — | — | — | — | — | — | — | ✓✓ | — | — | — | — | — | — |
+| T-DIST-009 Semantic paraphrase | — | — | ✓ | ✓✓ | — | — | — | — | — | — | — | — | — | — | — | ✓ |
+| T-DIST-010 gRPC bulk extraction | — | ✓ | — | — | — | — | ✓✓ | — | — | — | — | — | — | — | — | — |
+| T-DIST-011 Role preamble | — | — | — | — | — | — | — | — | — | — | — | ✓✓ | — | — | — | ✓ |
+| T-DIST-012 Token budget probing | — | — | — | — | — | — | — | — | — | — | — | — | — | ✓✓ | — | — |
+| T-DIST-013 Cloud automation | — | — | — | — | ✓ | — | — | — | — | — | ✓✓ | — | — | — | — | — |
+| T-DIST-014 Cron scheduling | — | ✓ | — | — | — | ✓ | — | — | — | — | — | — | ✓✓ | — | — | — |
+| T-DIST-015 Safety boundary mapping | — | — | — | — | — | — | — | — | — | — | — | — | — | — | ✓✓ | — |
+| T-DIST-016 Markov topic sweep | — | — | ✓ | ✓ | — | — | — | — | — | — | — | — | — | — | — | ✓✓ |
+
+**Column key**: Fp=Fingerprint, Vel=Velocity, CoT=CoT, Emb=Embed, Hyd=Hydra, TC=TimingCluster, H2=H2Grpc, Pvt=Pivot, Bio=Biometric, Wm=Watermark, ASN=AsnClassifier, RP=RolePreamble, SG=SessionGap, TB=TokenBudget, RfP=RefusalProbe, SM=SequenceModel
 | T-DIST-009 Semantic paraphrase | | | ✓ | ✓✓ | | | | | | |
 | T-DIST-010 gRPC bulk extraction | | ✓ | | | | | ✓✓ | | | |
 
@@ -245,16 +325,22 @@ The 10 workers are weighted based on:
 
 | Worker | Weight | Key Reasoning |
 |--------|--------|---------------|
-| `Fingerprint` | 0.20 | JA3+JA3S+header cross-consistency is near-impossible to fully spoof without custom TLS stack; very high precision |
-| `Velocity` | 0.13 | High precision on burst patterns; low false positive rate; commodity signal |
-| `CoT` | 0.12 | High recall for systematic extraction; Aho-Corasick O(n) at scale |
-| `Embed` | 0.10 | Paraphrase-resistant; catches obfuscated extraction prompts; moderate precision |
-| `Hydra` | 0.11 | Graph pivoting uniquely identifies multi-account coordination; no benign analogue |
-| `TimingCluster` | 0.09 | Sync bursts from load balancers are very difficult to randomize; high precision |
-| `H2Grpc` | 0.07 | Strong signal when present, but not all attacks use gRPC |
-| `Pivot` | 0.07 | Unique signal for late-stage campaigns; low false positives |
-| `Biometric` | 0.06 | Structural entropy is strong but requires 10+ prompts of history |
-| `Watermark` | 0.05 | High precision on canary hit; low recall until sufficient watermarks deployed |
+| `Fingerprint` | 0.14 | JA3+JA3S+header cross-consistency is near-impossible to fully spoof without custom TLS stack; very high precision |
+| `Velocity` | 0.10 | High precision on burst patterns; low false positive rate; commodity signal |
+| `CoT` | 0.09 | High recall for systematic extraction; Aho-Corasick O(n) at scale |
+| `Embed` | 0.08 | Paraphrase-resistant; catches obfuscated extraction prompts; moderate precision |
+| `Hydra` | 0.08 | Graph pivoting uniquely identifies multi-account coordination; no benign analogue |
+| `TimingCluster` | 0.07 | Sync bursts from load balancers are very difficult to randomize; high precision |
+| `AsnClassifier` | 0.07 | Cloud datacenter IPs are near-certain for automated jobs; high precision, broad coverage |
+| `H2Grpc` | 0.06 | Strong signal when present, but not all attacks use gRPC |
+| `RolePreamble` | 0.06 | Cross-account preamble collision is near-unique to coordinated campaigns |
+| `Pivot` | 0.05 | Unique signal for late-stage campaigns; low false positives |
+| `Biometric` | 0.05 | Structural entropy is strong but requires 10+ prompts of history |
+| `Watermark` | 0.04 | High precision on canary hit; low recall until sufficient watermarks deployed |
+| `SessionGap` | 0.04 | Cron regularity is a reliable automation fingerprint; complements Velocity |
+| `TokenBudget` | 0.03 | Strong when geometric sweep detected; moderate standalone signal |
+| `RefusalProbe` | 0.02 | Niche but high precision when cross-category sweep present |
+| `SequenceModel` | 0.02 | Unique signal for full-capability coverage; requires ≥15 prompts of history |
 
 ---
 

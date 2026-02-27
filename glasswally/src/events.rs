@@ -223,6 +223,10 @@ pub struct ApiEvent {
     pub ja3s_hash:           Option<String>,     // TLS ServerHello fingerprint (Tier 1)
     pub h2_settings:         Option<H2Settings>, // HTTP/2 SETTINGS frame (Tier 2)
     pub tls_library:         Option<TlsLibrary>, // detected TLS implementation
+    pub asn_number:          Option<u32>,        // BGP ASN of source IP (Phase 1)
+    pub asn_org:             Option<String>,     // ASN org name (e.g. "AMAZON-AES", "AS-CHOOPA")
+    pub max_tokens:          Option<u32>,        // requested max_tokens from API body
+    pub system_prompt_hash:  Option<String>,     // SHA256[:8] of system prompt / role preamble
     pub campaign_label:      Option<String>,
 }
 
@@ -237,29 +241,43 @@ pub enum WorkerKind {
     Semantic,        // legacy; use Embed
     Hydra,           // cluster graph scoring
     Pivot,           // coordinated model switch
-    // Tier 1
+    // Tier 1 (original)
     Watermark,       // response watermark probe detection
     Embed,           // semantic similarity — paraphrase-resistant CoT
     TimingCluster,   // cross-account synchronized burst detection
-    // Tier 2
+    // Tier 2 (original)
     H2Grpc,          // HTTP/2 SETTINGS + gRPC fingerprinting
     Biometric,       // behavioral sequence entropy
+    // Phase 1 — new signals
+    AsnClassifier,   // datacenter/hosting provider IP classification
+    RolePreamble,    // role injection preamble fingerprinting
+    SessionGap,      // inter-session timing regularity (cron detection)
+    TokenBudget,     // max_tokens sweep / greedy budget probing
+    RefusalProbe,    // safety refusal probe pattern detection
+    // Phase 3
+    SequenceModel,   // Markov chain over prompt topic transitions
 }
 
 impl std::fmt::Display for WorkerKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Fingerprint   => write!(f, "fingerprint"),
-            Self::Velocity      => write!(f, "velocity"),
-            Self::Cot           => write!(f, "cot"),
-            Self::Semantic      => write!(f, "semantic"),
-            Self::Hydra         => write!(f, "hydra"),
-            Self::Pivot         => write!(f, "pivot"),
-            Self::Watermark     => write!(f, "watermark"),
-            Self::Embed         => write!(f, "embed"),
-            Self::TimingCluster => write!(f, "timing_cluster"),
-            Self::H2Grpc        => write!(f, "h2_grpc"),
-            Self::Biometric     => write!(f, "biometric"),
+            Self::Fingerprint    => write!(f, "fingerprint"),
+            Self::Velocity       => write!(f, "velocity"),
+            Self::Cot            => write!(f, "cot"),
+            Self::Semantic       => write!(f, "semantic"),
+            Self::Hydra          => write!(f, "hydra"),
+            Self::Pivot          => write!(f, "pivot"),
+            Self::Watermark      => write!(f, "watermark"),
+            Self::Embed          => write!(f, "embed"),
+            Self::TimingCluster  => write!(f, "timing_cluster"),
+            Self::H2Grpc         => write!(f, "h2_grpc"),
+            Self::Biometric      => write!(f, "biometric"),
+            Self::AsnClassifier  => write!(f, "asn_classifier"),
+            Self::RolePreamble   => write!(f, "role_preamble"),
+            Self::SessionGap     => write!(f, "session_gap"),
+            Self::TokenBudget    => write!(f, "token_budget"),
+            Self::RefusalProbe   => write!(f, "refusal_probe"),
+            Self::SequenceModel  => write!(f, "sequence_model"),
         }
     }
 }

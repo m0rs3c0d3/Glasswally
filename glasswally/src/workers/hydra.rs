@@ -97,6 +97,39 @@ pub async fn analyze(event: &ApiEvent, store: &StateStore) -> Option<DetectionSi
         ));
     }
 
+    // ── Phase 3: Deep payment bipartite graph ─────────────────────────────────
+    // Collect per-member payment lists for bipartite analysis
+    let member_payment_lists: Vec<(String, Vec<String>)> = members.iter()
+        .filter_map(|m| {
+            store.get_window(m).map(|w| {
+                let payments: Vec<String> = w.read().payment_hashes.iter().cloned().collect();
+                (m.clone(), payments)
+            })
+        })
+        .collect();
+
+    let (max_shared, clique_size, _clique) = payment_bipartite_analysis(&member_payment_lists);
+    if max_shared >= 2 && clique_size >= 3 {
+        score += 0.25;
+        evidence.push(format!(
+            "payment_bipartite_clique:{}_accounts_share_{}_payment_methods",
+            clique_size, max_shared
+        ));
+    } else if max_shared >= 1 && clique_size >= 4 {
+        score += 0.15;
+        evidence.push(format!(
+            "payment_sharing:{}_accounts_share_common_method", clique_size
+        ));
+    }
+
+    // Virtual card provider clustering
+    if let Some((prefix, count)) = virtual_card_clustering(&all_payments) {
+        score += 0.12;
+        evidence.push(format!(
+            "virtual_card_cluster:prefix={}:{}_cards_same_provider", prefix, count
+        ));
+    }
+
     let confidence = (total_requests as f32 / 100.0).min(1.0);
     score = score.min(1.0);
 
@@ -129,4 +162,70 @@ fn payment_bin_groups(
         }
     }
     groups
+}
+
+// ── Phase 3: Deep payment graph analysis ─────────────────────────────────────
+// Build a bipartite graph: accounts on one side, payment method hashes on the
+// other.  Detect accounts that share ≥2 payment methods (strong coordination
+// evidence even across distinct BIN prefixes).
+//
+// Returns (max_shared_payments, n_accounts_in_max_clique, clique_members)
+
+pub(crate) fn payment_bipartite_analysis(
+    member_payments: &[(String, Vec<String>)],
+) -> (usize, usize, Vec<String>) {
+    if member_payments.len() < 2 {
+        return (0, 0, vec![]);
+    }
+
+    // For each pair of accounts, count shared payment methods.
+    let mut max_shared = 0usize;
+    let mut max_clique: Vec<String> = vec![];
+
+    for i in 0..member_payments.len() {
+        let (acc_i, pm_i) = &member_payments[i];
+        let set_i: std::collections::HashSet<_> = pm_i.iter().collect();
+
+        let mut clique_members = vec![acc_i.clone()];
+        let mut clique_payments = set_i.clone();
+
+        for j in (i + 1)..member_payments.len() {
+            let (acc_j, pm_j) = &member_payments[j];
+            let set_j: std::collections::HashSet<_> = pm_j.iter().collect();
+            let shared: std::collections::HashSet<_> = clique_payments.intersection(&set_j).collect();
+
+            if shared.len() >= 1 {
+                clique_members.push(acc_j.clone());
+                // Narrow clique to shared payments only
+                clique_payments = shared.into_iter().cloned().collect();
+            }
+        }
+
+        if clique_payments.len() > max_shared
+            || (clique_payments.len() == max_shared && clique_members.len() > max_clique.len())
+        {
+            max_shared = clique_payments.len();
+            max_clique = clique_members;
+        }
+    }
+
+    (max_shared, max_clique.len(), max_clique)
+}
+
+/// Detect virtual card provider clustering: if many distinct payment hashes
+/// share the same 2-char prefix from the same provider signature, it indicates
+/// bulk virtual card purchases from a single provider (e.g. Privacy.com, Revolut).
+pub(crate) fn virtual_card_clustering(
+    payments: &std::collections::HashSet<String>,
+) -> Option<(String, usize)> {
+    if payments.len() < 4 { return None; }
+    let mut prefix2: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for pm in payments {
+        if pm.len() >= 2 {
+            *prefix2.entry(pm[..2].to_string()).or_default() += 1;
+        }
+    }
+    prefix2.into_iter()
+        .filter(|(_, c)| *c >= 4)
+        .max_by_key(|(_, c)| *c)
 }

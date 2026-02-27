@@ -1,0 +1,116 @@
+# glasswally_rules.yaml — Falco rules for LLM distillation attack detection
+#
+# Load with: falco -r /etc/falco/rules.d/glasswally_rules.yaml
+# Requires: Glasswally Falco plugin loaded (see falco/README.md)
+
+- required_plugin_versions:
+  - name: glasswally
+    version: 0.1.0
+
+# ── Macro definitions ─────────────────────────────────────────────────────────
+
+- macro: glasswally_critical
+  condition: gw.tier = "CRITICAL"
+
+- macro: glasswally_high
+  condition: gw.tier = "HIGH"
+
+- macro: glasswally_cluster_attack
+  condition: gw.n_accounts_in_cluster >= 5
+
+- macro: glasswally_cluster_takedown
+  condition: gw.action = "CLUSTER_TAKEDOWN"
+
+# ── Rules ─────────────────────────────────────────────────────────────────────
+
+- rule: LLM Distillation Campaign - Critical Cluster
+  desc: >
+    Glasswally detected a coordinated LLM distillation campaign.
+    A cluster of 5+ accounts is systematically extracting model capabilities
+    at CRITICAL risk score. Immediate enforcement action has been taken.
+  condition: glasswally_critical and glasswally_cluster_attack
+  output: >
+    CRITICAL: LLM distillation cluster detected
+    account=%gw.account_id cluster_id=%gw.cluster_id
+    cluster_size=%gw.n_accounts_in_cluster composite_score=%gw.composite_score
+    action=%gw.action evidence=%gw.top_evidence country=%gw.country_code
+  priority: CRITICAL
+  tags: [llm, distillation, glasswally, T-DIST-002]
+
+- rule: LLM Distillation - High Risk Single Account
+  desc: >
+    Glasswally flagged a single high-risk account for suspected distillation.
+    Canary token injection initiated for attribution tracking.
+  condition: glasswally_high
+  output: >
+    WARNING: High-risk LLM distillation account
+    account=%gw.account_id composite_score=%gw.composite_score
+    action=%gw.action workers=%gw.worker_fired country=%gw.country_code
+  priority: WARNING
+  tags: [llm, distillation, glasswally]
+
+- rule: LLM Distillation Cluster Takedown Executed
+  desc: >
+    Glasswally executed a cluster takedown — all accounts in the distillation
+    cluster have been suspended. This rule fires for audit trail logging.
+  condition: glasswally_cluster_takedown
+  output: >
+    ALERT: Distillation cluster suspended
+    cluster_id=%gw.cluster_id affected_accounts=%gw.n_accounts_in_cluster
+    composite_score=%gw.composite_score evidence=%gw.top_evidence
+  priority: CRITICAL
+  tags: [llm, distillation, glasswally, enforcement, T-DIST-002]
+
+- rule: LLM Canary Token Triggered - Distillation Confirmed
+  desc: >
+    A canary token previously injected into a suspected distillation response
+    has appeared in a new inbound request. This confirms the account is
+    reproducing scraped LLM output — distillation is confirmed.
+  condition: >
+    gw.action = "INJECT_CANARY" and
+    gw.top_evidence contains "canary_triggered"
+  output: >
+    CONFIRMED: LLM distillation canary triggered
+    account=%gw.account_id composite_score=%gw.composite_score
+    cluster_id=%gw.cluster_id evidence=%gw.top_evidence
+  priority: CRITICAL
+  tags: [llm, distillation, canary, glasswally, T-DIST-008]
+
+- rule: LLM Fingerprint Suite Evasion Detected
+  desc: >
+    Glasswally detected JA3/JA3S mismatch or H2 SETTINGS inconsistency
+    indicative of Fingerprint Suite evasion tooling.
+  condition: >
+    gw.worker_fired contains "fingerprint" and
+    gw.top_evidence contains "ja3s_mismatch"
+  output: >
+    Fingerprint Suite evasion: account=%gw.account_id
+    composite_score=%gw.composite_score evidence=%gw.top_evidence
+  priority: WARNING
+  tags: [llm, distillation, evasion, glasswally, T-DIST-003]
+
+- rule: LLM Datacenter Cluster Detected
+  desc: >
+    A cluster of accounts all originate from datacenter/cloud ASNs.
+    Legitimate individual users do not share cloud datacenter IPs.
+  condition: >
+    gw.worker_fired contains "asn_classifier" and
+    gw.top_evidence contains "cloud_cluster"
+  output: >
+    Cloud-cluster distillation: account=%gw.account_id
+    cluster_id=%gw.cluster_id composite_score=%gw.composite_score
+    evidence=%gw.top_evidence country=%gw.country_code
+  priority: WARNING
+  tags: [llm, distillation, glasswally, asn, T-DIST-002]
+
+- rule: LLM Medium Risk - Rate Limit Enforced
+  desc: >
+    Glasswally applied a rate limit to a medium-risk account.
+    Monitoring for escalation to High/Critical tier.
+  condition: >
+    gw.tier = "MEDIUM" and gw.action = "RATE_LIMIT"
+  output: >
+    Rate limited: account=%gw.account_id composite_score=%gw.composite_score
+    workers=%gw.worker_fired
+  priority: NOTICE
+  tags: [llm, distillation, glasswally, rate_limit]

@@ -181,6 +181,10 @@ pub struct StateStore {
     // Key = Unix timestamp in seconds, Value = set of account_ids that fired in that second
     timing_buckets: DashMap<u64, HashSet<String>>,
 
+    // Role preamble index (Phase 1 — cross-account preamble collision detection)
+    // Key = preamble hash (SHA256[:8] of normalized role preamble), Value = account_ids
+    preamble_idx:   DashMap<String, HashSet<String>>,
+
     // Canary token registry (Tier 2 — response attribution)
     canary_registry: DashMap<String, CanaryToken>,  // token → metadata
 
@@ -207,6 +211,7 @@ impl StateStore {
             next_cluster:    parking_lot::Mutex::new(0),
             model_switches:  DashMap::new(),
             timing_buckets:  DashMap::new(),
+            preamble_idx:    DashMap::new(),
             canary_registry: DashMap::new(),
             watermarked:     DashMap::new(),
             total_events:    std::sync::atomic::AtomicU64::new(0),
@@ -268,6 +273,14 @@ impl StateStore {
             .entry(bucket)
             .or_default()
             .insert(event.account_id.clone());
+
+        // Record preamble hash (Phase 1 — role preamble collision detection)
+        if let Some(ref ph) = event.system_prompt_hash {
+            self.preamble_idx
+                .entry(ph.clone())
+                .or_default()
+                .insert(event.account_id.clone());
+        }
 
         // Trigger incremental cluster update
         self.update_clusters(&event.account_id);
@@ -373,6 +386,11 @@ impl StateStore {
 
     pub fn accounts_with_header_hash(&self, hash: &str) -> HashSet<String> {
         self.hdr_idx.get(hash).map(|a| a.clone()).unwrap_or_default()
+    }
+
+    /// Number of distinct accounts that share the given preamble hash (Phase 1).
+    pub fn accounts_with_preamble_hash(&self, hash: &str) -> usize {
+        self.preamble_idx.get(hash).map(|a| a.len()).unwrap_or(0)
     }
 
     pub fn n_accounts(&self) -> usize { self.accounts.len() }

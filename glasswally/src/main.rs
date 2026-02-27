@@ -25,11 +25,17 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 mod engine;
+mod eval;
 mod events;
+mod grpc_api;
 mod http_reconstruct;
 mod ioc_feed;
+mod kafka_output;
+mod load_shedder;
 mod loader;
+mod otel;
 mod redteam;
+mod redis_state;
 mod state;
 mod workers;
 

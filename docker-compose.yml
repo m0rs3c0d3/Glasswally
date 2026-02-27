@@ -1,0 +1,185 @@
+version: "3.9"
+
+# Glasswally local development stack
+#
+# Services:
+#   glasswally   — tail mode (reads mock JSONL log, no eBPF root required)
+#   loggen       — generates synthetic API gateway JSONL events
+#   redis        — state persistence (RedisConfig default: redis://redis:6379)
+#   kafka        — enforcement + IOC event bus (KafkaConfig default: kafka:9092)
+#   prometheus   — scrapes /metrics from glasswally:9090
+#   grafana      — dashboards at http://localhost:3000 (admin/admin)
+#
+# Usage:
+#   docker compose up --build
+#   docker compose up --build -d     # detached
+#   docker compose logs -f glasswally
+#
+# Live eBPF (requires Linux 5.8+ host, --privileged):
+#   docker compose --profile ebpf up --build
+
+networks:
+  gw:
+    driver: bridge
+
+volumes:
+  redis_data:
+  kafka_data:
+  prometheus_data:
+  grafana_data:
+  shared_logs:
+
+# ── Core services ─────────────────────────────────────────────────────────────
+
+services:
+
+  # Synthetic API gateway log generator — writes JSONL to shared_logs
+  loggen:
+    image: python:3.12-slim
+    volumes:
+      - shared_logs:/logs
+      - ./tools/loggen.py:/loggen.py:ro
+    command: python /loggen.py --output /logs/access.jsonl --rate 5 --seed 42
+    restart: unless-stopped
+    networks:
+      - gw
+
+  # Glasswally in tail mode — reads JSONL from shared_logs volume
+  glasswally:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - shared_logs:/logs:ro
+      - ./output:/output
+    environment:
+      RUST_LOG: "glasswally=info"
+      GLASSWALLY_REDIS_URL: "redis://redis:6379"
+      GLASSWALLY_KAFKA_BROKERS: "kafka:9092"
+    command: >
+      glasswally
+        --mode tail
+        --path /logs/access.jsonl
+        --output-dir /output
+        --metrics-addr 0.0.0.0:9090
+    ports:
+      - "9090:9090"   # Prometheus /metrics
+      - "50051:50051" # gRPC query API
+    depends_on:
+      - redis
+      - kafka
+      - loggen
+    restart: unless-stopped
+    networks:
+      - gw
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9090/metrics"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Redis — state persistence checkpoint store
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    networks:
+      - gw
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Kafka (KRaft mode, no Zookeeper)
+  kafka:
+    image: apache/kafka:3.7.0
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092"
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_LOG_RETENTION_HOURS: 24
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    ports:
+      - "9092:9092"
+    networks:
+      - gw
+    healthcheck:
+      test: ["CMD", "kafka-topics.sh", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  # Prometheus — scrapes glasswally /metrics every 5s
+  prometheus:
+    image: prom/prometheus:v2.51.2
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=7d"
+    ports:
+      - "9091:9090"
+    depends_on:
+      - glasswally
+    networks:
+      - gw
+
+  # Grafana — dashboards at http://localhost:3000
+  grafana:
+    image: grafana/grafana:10.4.2
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - gw
+
+# ── Live eBPF profile (Linux 5.8+ host required) ─────────────────────────────
+
+  glasswally-ebpf:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    profiles:
+      - ebpf
+    privileged: true
+    pid: "host"
+    volumes:
+      - /sys/kernel/debug:/sys/kernel/debug:ro
+      - ./output:/output
+    environment:
+      RUST_LOG: "glasswally=info"
+    command: >
+      glasswally
+        --mode ebpf
+        --output-dir /output
+        --metrics-addr 0.0.0.0:9090
+    ports:
+      - "9090:9090"
+      - "50051:50051"
+    depends_on:
+      - redis
+      - kafka
+    networks:
+      - gw

@@ -25,10 +25,9 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
 use tracing::info;
 
-use crate::events::{ApiEvent, DetectionSignal, RiskDecision, RiskTier, WorkerKind};
+use crate::events::{ApiEvent, WorkerKind};
 use crate::state::window::StateStore;
 
 // ── Per-worker performance counters ───────────────────────────────────────────
@@ -44,23 +43,39 @@ pub struct WorkerMetrics {
 impl WorkerMetrics {
     pub fn precision(&self) -> f64 {
         let denom = self.tp + self.fp;
-        if denom == 0 { 1.0 } else { self.tp as f64 / denom as f64 }
+        if denom == 0 {
+            1.0
+        } else {
+            self.tp as f64 / denom as f64
+        }
     }
 
     pub fn recall(&self) -> f64 {
         let denom = self.tp + self.fn_;
-        if denom == 0 { 0.0 } else { self.tp as f64 / denom as f64 }
+        if denom == 0 {
+            0.0
+        } else {
+            self.tp as f64 / denom as f64
+        }
     }
 
     pub fn f1(&self) -> f64 {
         let p = self.precision();
         let r = self.recall();
-        if p + r == 0.0 { 0.0 } else { 2.0 * p * r / (p + r) }
+        if p + r == 0.0 {
+            0.0
+        } else {
+            2.0 * p * r / (p + r)
+        }
     }
 
     pub fn fpr(&self) -> f64 {
         let denom = self.fp + self.tn;
-        if denom == 0 { 0.0 } else { self.fp as f64 / denom as f64 }
+        if denom == 0 {
+            0.0
+        } else {
+            self.fp as f64 / denom as f64
+        }
     }
 }
 
@@ -68,14 +83,14 @@ impl WorkerMetrics {
 
 #[derive(Debug)]
 pub struct EvalResult {
-    pub n_events:       usize,
-    pub n_positive:     usize,  // true distillation events
-    pub n_negative:     usize,  // legitimate traffic events
-    pub threshold:      f32,
-    pub global:         WorkerMetrics,
-    pub per_worker:     HashMap<WorkerKind, WorkerMetrics>,
-    pub tier_counts:    HashMap<String, u64>,
-    pub score_histogram: Vec<(f32, usize)>,  // (score_bin_lower, count)
+    pub n_events: usize,
+    pub n_positive: usize, // true distillation events
+    pub n_negative: usize, // legitimate traffic events
+    pub threshold: f32,
+    pub global: WorkerMetrics,
+    pub per_worker: HashMap<WorkerKind, WorkerMetrics>,
+    pub tier_counts: HashMap<String, u64>,
+    pub score_histogram: Vec<(f32, usize)>, // (score_bin_lower, count)
 }
 
 impl EvalResult {
@@ -100,8 +115,14 @@ impl EvalResult {
         let mut workers: Vec<_> = self.per_worker.iter().collect();
         workers.sort_by(|a, b| b.1.f1().partial_cmp(&a.1.f1()).unwrap());
         for (worker, m) in workers {
-            println!("| {:15} | {:.3} | {:.3} | {:.3} | {:.4} |",
-                worker, m.precision(), m.recall(), m.f1(), m.fpr());
+            println!(
+                "| {:15} | {:.3} | {:.3} | {:.3} | {:.4} |",
+                worker,
+                m.precision(),
+                m.recall(),
+                m.f1(),
+                m.fpr()
+            );
         }
 
         println!("\n### Score Distribution\n");
@@ -119,7 +140,9 @@ pub struct Evaluator {
 }
 
 impl Evaluator {
-    pub fn new(threshold: f32) -> Self { Self { threshold } }
+    pub fn new(threshold: f32) -> Self {
+        Self { threshold }
+    }
 
     pub async fn run_dataset(&self, path: &Path) -> Result<EvalResult> {
         let content = tokio::fs::read_to_string(path).await?;
@@ -127,7 +150,9 @@ impl Evaluator {
 
         for line in content.lines() {
             let line = line.trim();
-            if line.is_empty() { continue; }
+            if line.is_empty() {
+                continue;
+            }
             match serde_json::from_str::<ApiEvent>(line) {
                 Ok(ev) => events.push(ev),
                 Err(e) => tracing::warn!("Eval dataset parse error: {}", e),
@@ -139,17 +164,17 @@ impl Evaluator {
     }
 
     async fn evaluate(&self, events: Vec<ApiEvent>) -> Result<EvalResult> {
-        let store  = std::sync::Arc::new(StateStore::new());
+        let store = std::sync::Arc::new(StateStore::new());
         let engine = crate::engine::fusion::FusionEngine::new();
 
-        let n_events   = events.len();
+        let n_events = events.len();
         let n_positive = events.iter().filter(|e| e.campaign_label.is_some()).count();
         let n_negative = n_events - n_positive;
 
-        let mut global     = WorkerMetrics::default();
+        let mut global = WorkerMetrics::default();
         let mut per_worker: HashMap<WorkerKind, WorkerMetrics> = HashMap::new();
         let mut tier_counts: HashMap<String, u64> = HashMap::new();
-        let mut score_bins  = vec![0usize; 20]; // 0.05-wide bins
+        let mut score_bins = [0usize; 20]; // 0.05-wide bins
 
         for event in &events {
             store.ingest(event);
@@ -157,26 +182,29 @@ impl Evaluator {
             let decision = engine.fuse(event, &store, &signals);
 
             let is_positive = event.campaign_label.is_some();
-            let alerted     = decision.as_ref().map(|d| d.composite_score >= self.threshold).unwrap_or(false);
+            let alerted = decision
+                .as_ref()
+                .map(|d| d.composite_score >= self.threshold)
+                .unwrap_or(false);
 
             // Per-worker metrics
             for sig in &signals {
                 let m = per_worker.entry(sig.worker).or_default();
                 let worker_fired = sig.score >= 0.30;
                 match (worker_fired, is_positive) {
-                    (true,  true)  => m.tp  += 1,
-                    (true,  false) => m.fp  += 1,
-                    (false, true)  => m.fn_ += 1,
-                    (false, false) => m.tn  += 1,
+                    (true, true) => m.tp += 1,
+                    (true, false) => m.fp += 1,
+                    (false, true) => m.fn_ += 1,
+                    (false, false) => m.tn += 1,
                 }
             }
 
             // Global
             match (alerted, is_positive) {
-                (true,  true)  => global.tp  += 1,
-                (true,  false) => global.fp  += 1,
-                (false, true)  => global.fn_ += 1,
-                (false, false) => global.tn  += 1,
+                (true, true) => global.tp += 1,
+                (true, false) => global.fp += 1,
+                (false, true) => global.fn_ += 1,
+                (false, false) => global.tn += 1,
             }
 
             // Score histogram
@@ -187,14 +215,21 @@ impl Evaluator {
             }
         }
 
-        let score_histogram = score_bins.iter().enumerate()
+        let score_histogram = score_bins
+            .iter()
+            .enumerate()
             .map(|(i, &c)| (i as f32 * 0.05, c))
             .collect();
 
         Ok(EvalResult {
-            n_events, n_positive, n_negative,
+            n_events,
+            n_positive,
+            n_negative,
             threshold: self.threshold,
-            global, per_worker, tier_counts, score_histogram,
+            global,
+            per_worker,
+            tier_counts,
+            score_histogram,
         })
     }
 }

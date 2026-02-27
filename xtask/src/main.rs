@@ -7,6 +7,7 @@
 //   cargo xtask run                 # build-ebpf then cargo run
 //   cargo xtask run --release       # release build
 //   cargo xtask vmlinux             # generate vmlinux.h from running kernel
+//   cargo xtask evaluate [PATH]     # run eval harness against labeled JSONL dataset
 //
 // How it works:
 //   BPF programs must be compiled to a special target (bpfel-unknown-none)
@@ -23,11 +24,14 @@ fn main() {
     let task = args.get(1).map(|s| s.as_str()).unwrap_or("help");
     let release = args.contains(&"--release".to_string());
 
+    let path_arg = args.get(2).cloned();
+
     match task {
         "build-ebpf"  => build_ebpf(release),
         "run"         => { build_ebpf(release); run_userspace(release); }
         "vmlinux"     => generate_vmlinux(),
         "check"       => check(),
+        "evaluate"    => evaluate(path_arg),
         "help" | _    => print_help(),
     }
 }
@@ -159,6 +163,45 @@ fn check() {
     println!("All checks passed.");
 }
 
+/// Run the off-line evaluation harness against a labeled JSONL dataset.
+///
+/// Computes per-worker and aggregate Precision / Recall / F1 / FPR metrics
+/// and prints a Markdown table to stdout.
+///
+/// The dataset format is: one JSON object per line, where each object must
+/// contain at minimum { "account_id", "timestamp", "prompt" } plus an optional
+/// "campaign_label" field (non-null = positive/distillation, null = benign).
+///
+/// Example:
+///   cargo xtask evaluate datasets/labeled_5k.jsonl
+fn evaluate(path: Option<String>) {
+    let dataset_path = path.unwrap_or_else(|| "datasets/labeled_5k.jsonl".to_string());
+
+    if !std::path::Path::new(&dataset_path).exists() {
+        eprintln!("Dataset not found: {}", dataset_path);
+        eprintln!("Generate one with: python3 tools/loggen.py --output {} --count 5000", dataset_path);
+        std::process::exit(1);
+    }
+
+    let root = workspace_root();
+    let status = Command::new("cargo")
+        .current_dir(&root)
+        .args(&[
+            "run",
+            "--package", "glasswally",
+            "--quiet",
+            "--",
+            "--mode", "eval",
+            "--path", &dataset_path,
+        ])
+        .status()
+        .expect("Failed to run glasswally eval");
+
+    if !status.success() {
+        std::process::exit(1);
+    }
+}
+
 fn print_help() {
     println!("Glasswally build tooling\n");
     println!("USAGE:");
@@ -168,6 +211,7 @@ fn print_help() {
     println!("  run          Build BPF + run userspace pipeline");
     println!("  vmlinux      Generate vmlinux.h from running kernel BTF");
     println!("  check        Run cargo check on all crates");
+  println!("  evaluate     Run eval harness (default: datasets/labeled_5k.jsonl)");
     println!("\nPREREQUISITES:");
     println!("  rustup toolchain install nightly");
     println!("  rustup target add bpfel-unknown-none --toolchain nightly");

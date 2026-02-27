@@ -17,19 +17,22 @@ use crate::state::window::StateStore;
 
 pub async fn analyze(event: &ApiEvent, store: &StateStore) -> Option<DetectionSignal> {
     let cluster_id = store.get_cluster(&event.account_id)?;
-    let members    = store.cluster_members(cluster_id);
-    let n          = members.len();
+    let members = store.cluster_members(cluster_id);
+    let n = members.len();
 
     if n < 3 {
         return Some(DetectionSignal {
-            worker: WorkerKind::Hydra, account_id: event.account_id.clone(),
-            score: 0.0, confidence: 0.2,
+            worker: WorkerKind::Hydra,
+            account_id: event.account_id.clone(),
+            score: 0.0,
+            confidence: 0.2,
             evidence: vec!["small_cluster".into()],
-            meta: Default::default(), timestamp: Utc::now(),
+            meta: Default::default(),
+            timestamp: Utc::now(),
         });
     }
 
-    let mut score    = 0.0f32;
+    let mut score = 0.0f32;
     let mut evidence = Vec::new();
 
     // Cluster size contribution
@@ -38,11 +41,11 @@ pub async fn analyze(event: &ApiEvent, store: &StateStore) -> Option<DetectionSi
     evidence.push(format!("cluster_{}_size:{}", cluster_id, n));
 
     // Aggregate infrastructure across cluster
-    let mut all_payments  = std::collections::HashSet::new();
-    let mut shared_subnets= std::collections::HashSet::new();
+    let mut all_payments = std::collections::HashSet::new();
+    let mut shared_subnets = std::collections::HashSet::new();
     let mut all_countries = std::collections::HashSet::new();
-    let mut all_h2_fps    = std::collections::HashSet::new();
-    let mut total_requests= 0usize;
+    let mut all_h2_fps = std::collections::HashSet::new();
+    let mut total_requests = 0usize;
 
     for member_id in &members {
         if let Some(w) = store.get_window(member_id) {
@@ -82,7 +85,9 @@ pub async fn analyze(event: &ApiEvent, store: &StateStore) -> Option<DetectionSi
             score += 0.20;
             evidence.push(format!(
                 "payment_batch_correlation:bin_prefix={}:{}_cards={:.0}%",
-                dominant_bin, bin_count, bin_ratio * 100.0
+                dominant_bin,
+                bin_count,
+                bin_ratio * 100.0
             ));
         }
     }
@@ -99,7 +104,8 @@ pub async fn analyze(event: &ApiEvent, store: &StateStore) -> Option<DetectionSi
 
     // ── Phase 3: Deep payment bipartite graph ─────────────────────────────────
     // Collect per-member payment lists for bipartite analysis
-    let member_payment_lists: Vec<(String, Vec<String>)> = members.iter()
+    let member_payment_lists: Vec<(String, Vec<String>)> = members
+        .iter()
         .filter_map(|m| {
             store.get_window(m).map(|w| {
                 let payments: Vec<String> = w.read().payment_hashes.iter().cloned().collect();
@@ -118,7 +124,8 @@ pub async fn analyze(event: &ApiEvent, store: &StateStore) -> Option<DetectionSi
     } else if max_shared >= 1 && clique_size >= 4 {
         score += 0.15;
         evidence.push(format!(
-            "payment_sharing:{}_accounts_share_common_method", clique_size
+            "payment_sharing:{}_accounts_share_common_method",
+            clique_size
         ));
     }
 
@@ -126,7 +133,8 @@ pub async fn analyze(event: &ApiEvent, store: &StateStore) -> Option<DetectionSi
     if let Some((prefix, count)) = virtual_card_clustering(&all_payments) {
         score += 0.12;
         evidence.push(format!(
-            "virtual_card_cluster:prefix={}:{}_cards_same_provider", prefix, count
+            "virtual_card_cluster:prefix={}:{}_cards_same_provider",
+            prefix, count
         ));
     }
 
@@ -134,17 +142,19 @@ pub async fn analyze(event: &ApiEvent, store: &StateStore) -> Option<DetectionSi
     score = score.min(1.0);
 
     Some(DetectionSignal {
-        worker:     WorkerKind::Hydra,
+        worker: WorkerKind::Hydra,
         account_id: event.account_id.clone(),
         score,
         confidence,
         evidence,
         meta: [
-            ("cluster_id".into(),      json!(cluster_id)),
-            ("cluster_size".into(),    json!(n)),
-            ("total_requests".into(),  json!(total_requests)),
-            ("n_payment_methods".into(),json!(all_payments.len())),
-        ].into_iter().collect(),
+            ("cluster_id".into(), json!(cluster_id)),
+            ("cluster_size".into(), json!(n)),
+            ("total_requests".into(), json!(total_requests)),
+            ("n_payment_methods".into(), json!(all_payments.len())),
+        ]
+        .into_iter()
+        .collect(),
         timestamp: Utc::now(),
     })
 }
@@ -189,12 +199,12 @@ pub(crate) fn payment_bipartite_analysis(
         let mut clique_members = vec![acc_i.clone()];
         let mut clique_payments = set_i.clone();
 
-        for j in (i + 1)..member_payments.len() {
-            let (acc_j, pm_j) = &member_payments[j];
+        for (acc_j, pm_j) in member_payments.iter().skip(i + 1) {
             let set_j: std::collections::HashSet<_> = pm_j.iter().collect();
-            let shared: std::collections::HashSet<_> = clique_payments.intersection(&set_j).collect();
+            let shared: std::collections::HashSet<_> =
+                clique_payments.intersection(&set_j).collect();
 
-            if shared.len() >= 1 {
+            if !shared.is_empty() {
                 clique_members.push(acc_j.clone());
                 // Narrow clique to shared payments only
                 clique_payments = shared.into_iter().cloned().collect();
@@ -218,14 +228,17 @@ pub(crate) fn payment_bipartite_analysis(
 pub(crate) fn virtual_card_clustering(
     payments: &std::collections::HashSet<String>,
 ) -> Option<(String, usize)> {
-    if payments.len() < 4 { return None; }
+    if payments.len() < 4 {
+        return None;
+    }
     let mut prefix2: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for pm in payments {
         if pm.len() >= 2 {
             *prefix2.entry(pm[..2].to_string()).or_default() += 1;
         }
     }
-    prefix2.into_iter()
+    prefix2
+        .into_iter()
         .filter(|(_, c)| *c >= 4)
         .max_by_key(|(_, c)| *c)
 }

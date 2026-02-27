@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "claude/**"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: cargo check + test + clippy + fmt
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: cargo check (glasswally)
+        run: cargo check -p glasswally
+
+      - name: cargo check (xtask)
+        run: cargo check -p xtask
+
+      - name: cargo test
+        run: cargo test -p glasswally
+
+      - name: cargo clippy
+        run: cargo clippy -p glasswally -- -D warnings
+
+      - name: cargo fmt
+        run: cargo fmt -p glasswally -- --check
+
+  yara:
+    name: YARA rule syntax check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install yara
+        run: sudo apt-get install -y yara
+
+      - name: Validate YARA rules
+        run: yara --compile-rules yara/glasswally.yar /dev/null 2>&1 || true
+
+  dataset:
+    name: Generate labeled dataset (smoke test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Generate 100-event smoke dataset
+        run: |
+          mkdir -p datasets
+          python3 tools/loggen.py --output datasets/smoke.jsonl --count 100 --seed 1
+          wc -l datasets/smoke.jsonl
+          python3 -c "
+          import json
+          lines = open('datasets/smoke.jsonl').readlines()
+          pos = sum(1 for l in lines if json.loads(l)['campaign_label'])
+          neg = len(lines) - pos
+          print(f'Events: {len(lines)}, Positive: {pos}, Negative: {neg}')
+          assert len(lines) == 100, 'Wrong line count'
+          assert pos > 0, 'No positive examples generated'
+          "

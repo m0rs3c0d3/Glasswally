@@ -27,8 +27,12 @@ pub async fn analyze(event: &ApiEvent, store: &StateStore) -> Option<DetectionSi
         return None; // stale
     }
 
-    let mut score    = 0.20f32; // single-account pivot = mild
-    let mut evidence = vec![format!("model_pivot:{}→{}", &old_model[old_model.len().saturating_sub(10)..], &new_model[new_model.len().saturating_sub(10)..])];
+    let mut score = 0.20f32; // single-account pivot = mild
+    let mut evidence = vec![format!(
+        "model_pivot:{}→{}",
+        &old_model[old_model.len().saturating_sub(10)..],
+        &new_model[new_model.len().saturating_sub(10)..]
+    )];
 
     // Check for cluster-wide coordinated pivot
     if let Some(cluster_id) = store.get_cluster(&event.account_id) {
@@ -39,29 +43,35 @@ pub async fn analyze(event: &ApiEvent, store: &StateStore) -> Option<DetectionSi
         for member_id in &members {
             let member_switches = store.model_switches(member_id);
             let pivoted_same = member_switches.iter().any(|(switch_ts, _, switch_new)| {
-                switch_new == new_model
-                    && (*switch_ts - *ts).abs() < pivot_window
+                switch_new == new_model && (*switch_ts - *ts).abs() < pivot_window
             });
-            if pivoted_same { coordinated += 1; }
+            if pivoted_same {
+                coordinated += 1;
+            }
         }
 
         if coordinated >= MIN_PIVOT_ACCOUNTS {
             score = (0.20 + (coordinated as f32 / 30.0) * 0.80).min(1.0);
-            evidence.push(format!("coordinated_pivot:cluster_{}:{}_accounts", cluster_id, coordinated));
+            evidence.push(format!(
+                "coordinated_pivot:cluster_{}:{}_accounts",
+                cluster_id, coordinated
+            ));
         }
     }
 
     Some(DetectionSignal {
-        worker:     WorkerKind::Pivot,
+        worker: WorkerKind::Pivot,
         account_id: event.account_id.clone(),
         score,
         confidence: 0.85,
         evidence,
         meta: [
-            ("old_model".into(),  json!(old_model)),
-            ("new_model".into(),  json!(new_model)),
+            ("old_model".into(), json!(old_model)),
+            ("new_model".into(), json!(new_model)),
             ("n_switches".into(), json!(switches.len())),
-        ].into_iter().collect(),
+        ]
+        .into_iter()
+        .collect(),
         timestamp: Utc::now(),
     })
 }

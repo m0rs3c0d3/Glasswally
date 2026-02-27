@@ -6,7 +6,5 @@
 fn main() {
     // Re-run if BPF source or compiled object changes.
     println!("cargo:rerun-if-changed=../glasswally-ebpf/src/main.rs");
-    println!(
-        "cargo:rerun-if-changed=../target/bpfel-unknown-none/release/glasswally-ebpf"
-    );
+    println!("cargo:rerun-if-changed=../target/bpfel-unknown-none/release/glasswally-ebpf");
 }

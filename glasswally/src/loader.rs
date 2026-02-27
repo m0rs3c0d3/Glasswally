@@ -16,20 +16,21 @@
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Context, Result};
+#[cfg(feature = "live-ebpf")]
+use aya::include_bytes_aligned;
 use aya::{
-    include_bytes_aligned,
-    maps::AsyncPerfEventArray,
+    maps::{AsyncPerfEventArray, MapData},
     programs::{KProbe, UProbe},
     util::online_cpus,
-    Bpf, BpfLoader,
+    Ebpf, EbpfLoader,
 };
-use aya_log::BpfLogger;
+use aya_log::EbpfLogger;
 use bytes::BytesMut;
 use chrono::Utc;
 use tokio::sync::mpsc;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
-use crate::events::{RawSslEvent, SslCapture, SslDirection, TlsLibrary, MAX_BUF};
+use crate::events::{RawSslEvent, SslCapture, SslDirection, MAX_BUF};
 
 // ── TLS library paths ─────────────────────────────────────────────────────────
 
@@ -59,31 +60,31 @@ const NSS_PATHS: &[&str] = &[
 
 // ── Symbol names ──────────────────────────────────────────────────────────────
 
-const SSL_WRITE_SYMS:     &[&str] = &["ssl_write", "SSL_write"];
-const SSL_READ_SYMS:      &[&str] = &["ssl_read",  "SSL_read"];
-const NSS_WRITE_SYMS:     &[&str] = &["PR_Write",  "PR_Send"];
-const NSS_READ_SYMS:      &[&str] = &["PR_Read",   "PR_Recv"];
-const GO_TLS_WRITE_SYMS:  &[&str] = &["crypto/tls.(*Conn).Write"];
-const GO_TLS_READ_SYMS:   &[&str] = &["crypto/tls.(*Conn).Read"];
+const SSL_WRITE_SYMS: &[&str] = &["ssl_write", "SSL_write"];
+const SSL_READ_SYMS: &[&str] = &["ssl_read", "SSL_read"];
+const NSS_WRITE_SYMS: &[&str] = &["PR_Write", "PR_Send"];
+const NSS_READ_SYMS: &[&str] = &["PR_Read", "PR_Recv"];
+const GO_TLS_WRITE_SYMS: &[&str] = &["crypto/tls.(*Conn).Write"];
+const GO_TLS_READ_SYMS: &[&str] = &["crypto/tls.(*Conn).Read"];
 
 // ── GlasswallLoader ───────────────────────────────────────────────────────────
 
-pub struct GlasswallLoader { bpf: Bpf }
+pub struct GlasswallLoader {
+    bpf: Ebpf,
+}
 
 #[derive(Debug, Default)]
 pub struct AttachReport {
-    pub openssl:   Option<PathBuf>,
+    pub openssl: Option<PathBuf>,
     pub boringssl: Option<PathBuf>,
-    pub nss:       Option<PathBuf>,
-    pub go_bins:   Vec<PathBuf>,
+    pub nss: Option<PathBuf>,
+    pub go_bins: Vec<PathBuf>,
 }
 
 impl GlasswallLoader {
     pub fn load() -> Result<Self> {
         #[cfg(feature = "live-ebpf")]
-        let bpf_bytes = include_bytes_aligned!(
-            concat!(env!("OUT_DIR"), "/glasswally-ebpf")
-        );
+        let bpf_bytes = include_bytes_aligned!(concat!(env!("OUT_DIR"), "/glasswally-ebpf"));
         #[cfg(not(feature = "live-ebpf"))]
         let bpf_bytes: &[u8] = &[];
 
@@ -94,8 +95,10 @@ impl GlasswallLoader {
             ));
         }
 
-        let bpf = BpfLoader::new().load(bpf_bytes).context("Failed to load BPF object")?;
-        if let Err(e) = BpfLogger::init(&mut bpf) {
+        let mut bpf = EbpfLoader::new()
+            .load(bpf_bytes)
+            .context("Failed to load BPF object")?;
+        if let Err(e) = EbpfLogger::init(&mut bpf) {
             warn!("BPF logger init failed (non-fatal): {}", e);
         }
         Ok(Self { bpf })
@@ -135,22 +138,28 @@ impl GlasswallLoader {
             }
         }
 
-        if report.openssl.is_none() && report.boringssl.is_none()
-            && report.nss.is_none() && report.go_bins.is_empty()
+        if report.openssl.is_none()
+            && report.boringssl.is_none()
+            && report.nss.is_none()
+            && report.go_bins.is_empty()
         {
             return Err(anyhow!("No TLS library found to attach to"));
         }
 
         // tcp_connect kprobe
-        if let Ok(prog) = self.bpf.program_mut("tcp_connect_entry").context("no tcp_connect_entry") {
-            let kp: &mut KProbe = prog.try_into()?;
+        if let Ok(prog) = self
+            .bpf
+            .program_mut("tcp_connect_entry")
+            .context("no tcp_connect_entry")
+        {
+            let kp = TryInto::<&mut KProbe>::try_into(prog)?;
             kp.load()?;
             kp.attach("tcp_connect", 0).ok();
             info!("Attached kprobe: tcp_connect");
         }
 
         // DoH kprobe (Tier 3)
-        if let Ok(prog) = self.bpf.program_mut("udp_sendmsg_entry") {
+        if let Some(prog) = self.bpf.program_mut("udp_sendmsg_entry") {
             if let Ok(kp) = TryInto::<&mut KProbe>::try_into(prog) {
                 if kp.load().and_then(|_| kp.attach("udp_sendmsg", 0)).is_ok() {
                     info!("Attached kprobe: udp_sendmsg (DoH detection)");
@@ -159,29 +168,47 @@ impl GlasswallLoader {
         }
 
         // Perf ring buffer
-        let ssl_map: AsyncPerfEventArray<RawSslEvent> = self.bpf
-            .take_map("SSL_EVENTS").context("SSL_EVENTS not found")?.try_into()?;
+        let mut ssl_map: AsyncPerfEventArray<MapData> = self
+            .bpf
+            .take_map("SSL_EVENTS")
+            .context("SSL_EVENTS not found")?
+            .try_into()?;
 
         for cpu_id in online_cpus().unwrap_or_else(|_| vec![0]) {
             let tx2 = tx.clone();
             let mut buf = ssl_map.open(cpu_id, None)?;
             tokio::spawn(async move {
-                let mut buffers = (0..10).map(|_| BytesMut::with_capacity(MAX_BUF + 64)).collect::<Vec<_>>();
+                let mut buffers = (0..10)
+                    .map(|_| BytesMut::with_capacity(MAX_BUF + 64))
+                    .collect::<Vec<_>>();
                 loop {
                     let events = match buf.read_events(&mut buffers).await {
-                        Ok(e) => e, Err(e) => { error!("Perf CPU{}: {}", cpu_id, e); break; }
+                        Ok(e) => e,
+                        Err(e) => {
+                            error!("Perf CPU{}: {}", cpu_id, e);
+                            break;
+                        }
                     };
                     for bd in buffers.iter().take(events.read) {
-                        let Some(raw) = parse_ssl_event(bd) else { continue };
-                        let text = String::from_utf8_lossy(
-                            &raw.buf[..raw.buf_len.min(MAX_BUF as u32) as usize]).into_owned();
-                        let cap = SslCapture {
-                            pid: raw.pid, fd: raw.fd,
-                            direction: SslDirection::from(raw.direction),
-                            text, timestamp: Utc::now(),
-                            account_id: None, conn_key: None,
+                        let Some(raw) = parse_ssl_event(bd) else {
+                            continue;
                         };
-                        if tx2.send(cap).await.is_err() { break; }
+                        let text = String::from_utf8_lossy(
+                            &raw.buf[..raw.buf_len.min(MAX_BUF as u32) as usize],
+                        )
+                        .into_owned();
+                        let cap = SslCapture {
+                            pid: raw.pid,
+                            fd: raw.fd,
+                            direction: SslDirection::from(raw.direction),
+                            text,
+                            timestamp: Utc::now(),
+                            account_id: None,
+                            conn_key: None,
+                        };
+                        if tx2.send(cap).await.is_err() {
+                            break;
+                        }
                     }
                 }
             });
@@ -191,16 +218,29 @@ impl GlasswallLoader {
         Ok((rx, report))
     }
 
-    fn attach_ssl_pair(&mut self, lib: &PathBuf, write_syms: &[&str], read_syms: &[&str]) -> Result<()> {
+    fn attach_ssl_pair(
+        &mut self,
+        lib: &PathBuf,
+        write_syms: &[&str],
+        read_syms: &[&str],
+    ) -> Result<()> {
         self.attach_uprobe_any("ssl_write_enter", lib, write_syms, false)?;
-        self.attach_uprobe_any("ssl_write_exit",  lib, write_syms, true)?;
-        self.attach_uprobe_any("ssl_read_enter",  lib, read_syms,  false)?;
-        self.attach_uprobe_any("ssl_read_exit",   lib, read_syms,  true)?;
+        self.attach_uprobe_any("ssl_write_exit", lib, write_syms, true)?;
+        self.attach_uprobe_any("ssl_read_enter", lib, read_syms, false)?;
+        self.attach_uprobe_any("ssl_read_exit", lib, read_syms, true)?;
         Ok(())
     }
 
-    fn attach_uprobe_any(&mut self, prog: &str, lib: &PathBuf, syms: &[&str], is_ret: bool) -> Result<()> {
-        let p = self.bpf.program_mut(prog)
+    fn attach_uprobe_any(
+        &mut self,
+        prog: &str,
+        lib: &PathBuf,
+        syms: &[&str],
+        _is_ret: bool,
+    ) -> Result<()> {
+        let p = self
+            .bpf
+            .program_mut(prog)
             .with_context(|| format!("{prog} not found in BPF object"))?;
         let up: &mut UProbe = p.try_into()?;
         up.load()?;
@@ -219,12 +259,18 @@ impl GlasswallLoader {
         let r_off = find_go_symbol_offset(bin, GO_TLS_READ_SYMS)
             .context("crypto/tls.(*Conn).Read not found")?;
 
-        let wp = self.bpf.program_mut("ssl_write_enter").context("ssl_write_enter missing")?;
+        let wp = self
+            .bpf
+            .program_mut("ssl_write_enter")
+            .context("ssl_write_enter missing")?;
         let wu: &mut UProbe = wp.try_into()?;
         wu.load()?;
         wu.attach(None, w_off, bin, None)?;
 
-        let rp = self.bpf.program_mut("ssl_read_enter").context("ssl_read_enter missing")?;
+        let rp = self
+            .bpf
+            .program_mut("ssl_read_enter")
+            .context("ssl_read_enter missing")?;
         let ru: &mut UProbe = rp.try_into()?;
         ru.load()?;
         ru.attach(None, r_off, bin, None)?;
@@ -239,7 +285,9 @@ impl GlasswallLoader {
 fn find_library(paths: &[&str], label: &str) -> Option<PathBuf> {
     for p in paths {
         let pb = PathBuf::from(p);
-        if pb.exists() { return Some(pb); }
+        if pb.exists() {
+            return Some(pb);
+        }
     }
     // Scan /proc for loaded instances
     for proc_dir in std::fs::read_dir("/proc").ok()?.flatten() {
@@ -248,7 +296,9 @@ fn find_library(paths: &[&str], label: &str) -> Option<PathBuf> {
                 if line.to_lowercase().contains(label) {
                     if let Some(p) = line.split_whitespace().last() {
                         let pb = PathBuf::from(p);
-                        if pb.exists() { return Some(pb); }
+                        if pb.exists() {
+                            return Some(pb);
+                        }
                     }
                 }
             }
@@ -259,7 +309,9 @@ fn find_library(paths: &[&str], label: &str) -> Option<PathBuf> {
 
 fn find_go_tls_binaries() -> Vec<PathBuf> {
     let mut found = Vec::new();
-    let Ok(procs) = std::fs::read_dir("/proc") else { return found };
+    let Ok(procs) = std::fs::read_dir("/proc") else {
+        return found;
+    };
     for entry in procs.flatten() {
         if let Ok(bin) = std::fs::read_link(entry.path().join("exe")) {
             if bin.exists() && !found.contains(&bin) && is_go_tls_binary(&bin) {
@@ -271,8 +323,12 @@ fn find_go_tls_binaries() -> Vec<PathBuf> {
 }
 
 fn is_go_tls_binary(path: &PathBuf) -> bool {
-    let Ok(data) = std::fs::read(path) else { return false };
-    if data.len() > 256 * 1024 * 1024 { return false; }
+    let Ok(data) = std::fs::read(path) else {
+        return false;
+    };
+    if data.len() > 256 * 1024 * 1024 {
+        return false;
+    }
     memfind(&data, b"crypto/tls")
 }
 
@@ -282,16 +338,22 @@ fn find_go_symbol_offset(path: &PathBuf, syms: &[&str]) -> Option<u64> {
         let needle = sym.as_bytes();
         let mut pos = 0usize;
         while pos + needle.len() <= data.len() {
-            if let Some(idx) = data[pos..].windows(needle.len())
-                .position(|w| w == needle).map(|p| p + pos)
+            if let Some(idx) = data[pos..]
+                .windows(needle.len())
+                .position(|w| w == needle)
+                .map(|p| p + pos)
             {
                 if idx >= 16 {
-                    let vb: [u8; 8] = data[idx-16..idx-8].try_into().ok()?;
+                    let vb: [u8; 8] = data[idx - 16..idx - 8].try_into().ok()?;
                     let addr = u64::from_le_bytes(vb);
-                    if addr > 0x1000 { return Some(addr); }
+                    if addr > 0x1000 {
+                        return Some(addr);
+                    }
                 }
                 pos = idx + 1;
-            } else { break; }
+            } else {
+                break;
+            }
         }
     }
     None
@@ -302,6 +364,8 @@ fn memfind(hay: &[u8], needle: &[u8]) -> bool {
 }
 
 fn parse_ssl_event(buf: &BytesMut) -> Option<RawSslEvent> {
-    if buf.len() < std::mem::size_of::<RawSslEvent>() { return None; }
+    if buf.len() < std::mem::size_of::<RawSslEvent>() {
+        return None;
+    }
     Some(unsafe { &*(buf.as_ptr() as *const RawSslEvent) }.clone())
 }

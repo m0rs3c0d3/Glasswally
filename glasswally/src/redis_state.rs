@@ -39,21 +39,21 @@ use crate::state::window::StateStore;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RedisConfig {
-    pub url:             String,   // redis://127.0.0.1:6379
-    pub key_prefix:      String,   // "gw:" by default
-    pub window_ttl_days: u32,      // AccountWindow TTL
-    pub canary_ttl_days: u32,      // CanaryToken TTL
+    pub url: String,          // redis://127.0.0.1:6379
+    pub key_prefix: String,   // "gw:" by default
+    pub window_ttl_days: u32, // AccountWindow TTL
+    pub canary_ttl_days: u32, // CanaryToken TTL
     pub checkpoint_interval_secs: u64,
 }
 
 impl Default for RedisConfig {
     fn default() -> Self {
         Self {
-            url:                      "redis://127.0.0.1:6379".to_string(),
-            key_prefix:               "gw:".to_string(),
-            window_ttl_days:          7,
-            canary_ttl_days:          90,
-            checkpoint_interval_secs: 300,  // save every 5 minutes
+            url: "redis://127.0.0.1:6379".to_string(),
+            key_prefix: "gw:".to_string(),
+            window_ttl_days: 7,
+            canary_ttl_days: 90,
+            checkpoint_interval_secs: 300, // save every 5 minutes
         }
     }
 }
@@ -62,7 +62,7 @@ impl Default for RedisConfig {
 
 pub struct RedisPersistence {
     config: RedisConfig,
-    store:  Arc<StateStore>,
+    store: Arc<StateStore>,
 }
 
 impl RedisPersistence {

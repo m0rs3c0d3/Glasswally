@@ -29,16 +29,21 @@ use crate::events::ApiEvent;
 use crate::state::window::StateStore;
 
 // ── Watermarks ────────────────────────────────────────────────────────────────
-const LOW_WATER:  usize = 4_096;
-const MID_WATER:  usize = 8_192;
+const LOW_WATER: usize = 4_096;
+const MID_WATER: usize = 8_192;
 const HIGH_WATER: usize = 12_288;
 
 // ── Priority levels ───────────────────────────────────────────────────────────
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Priority { P0Critical, P1Cluster, P2Known, P3New }
+pub enum Priority {
+    P0Critical,
+    P1Cluster,
+    P2Known,
+    P3New,
+}
 
 pub struct LoadShedder {
-    pub shed_total:  AtomicU64,
+    pub shed_total: AtomicU64,
     pub accepted_p0: AtomicU64,
     pub accepted_p1: AtomicU64,
     pub accepted_p2: AtomicU64,
@@ -49,7 +54,7 @@ pub struct LoadShedder {
 impl LoadShedder {
     pub fn new(store: Arc<StateStore>) -> Arc<Self> {
         Arc::new(Self {
-            shed_total:  AtomicU64::new(0),
+            shed_total: AtomicU64::new(0),
             accepted_p0: AtomicU64::new(0),
             accepted_p1: AtomicU64::new(0),
             accepted_p2: AtomicU64::new(0),
@@ -65,17 +70,17 @@ impl LoadShedder {
 
         let accept = match priority {
             Priority::P0Critical => true,
-            Priority::P1Cluster  => queue_depth < HIGH_WATER,
-            Priority::P2Known    => queue_depth < MID_WATER,
-            Priority::P3New      => queue_depth < LOW_WATER,
+            Priority::P1Cluster => queue_depth < HIGH_WATER,
+            Priority::P2Known => queue_depth < MID_WATER,
+            Priority::P3New => queue_depth < LOW_WATER,
         };
 
         if accept {
             match priority {
                 Priority::P0Critical => self.accepted_p0.fetch_add(1, Ordering::Relaxed),
-                Priority::P1Cluster  => self.accepted_p1.fetch_add(1, Ordering::Relaxed),
-                Priority::P2Known    => self.accepted_p2.fetch_add(1, Ordering::Relaxed),
-                Priority::P3New      => self.accepted_p3.fetch_add(1, Ordering::Relaxed),
+                Priority::P1Cluster => self.accepted_p1.fetch_add(1, Ordering::Relaxed),
+                Priority::P2Known => self.accepted_p2.fetch_add(1, Ordering::Relaxed),
+                Priority::P3New => self.accepted_p3.fetch_add(1, Ordering::Relaxed),
             };
         } else {
             self.shed_total.fetch_add(1, Ordering::Relaxed);
@@ -104,7 +109,7 @@ impl LoadShedder {
 
     pub fn stats(&self) -> ShedStats {
         ShedStats {
-            shed_total:  self.shed_total.load(Ordering::Relaxed),
+            shed_total: self.shed_total.load(Ordering::Relaxed),
             accepted_p0: self.accepted_p0.load(Ordering::Relaxed),
             accepted_p1: self.accepted_p1.load(Ordering::Relaxed),
             accepted_p2: self.accepted_p2.load(Ordering::Relaxed),
@@ -115,7 +120,7 @@ impl LoadShedder {
 
 #[derive(Debug, Clone)]
 pub struct ShedStats {
-    pub shed_total:  u64,
+    pub shed_total: u64,
     pub accepted_p0: u64,
     pub accepted_p1: u64,
     pub accepted_p2: u64,
@@ -129,6 +134,10 @@ impl ShedStats {
 
     pub fn shed_rate(&self) -> f64 {
         let total = self.total_accepted() + self.shed_total;
-        if total == 0 { 0.0 } else { self.shed_total as f64 / total as f64 }
+        if total == 0 {
+            0.0
+        } else {
+            self.shed_total as f64 / total as f64
+        }
     }
 }

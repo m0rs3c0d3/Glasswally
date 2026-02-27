@@ -39,19 +39,29 @@ const GREEDY_THRESHOLD: f32 = 0.90;
 const MIN_SAMPLES: usize = 6;
 
 fn nearest_model_max(v: u32) -> u32 {
-    *MODEL_MAXIMA.iter().min_by_key(|&&m| (m as i64 - v as i64).unsigned_abs()).unwrap_or(&4096)
+    *MODEL_MAXIMA
+        .iter()
+        .min_by_key(|&&m| (m as i64 - v as i64).unsigned_abs())
+        .unwrap_or(&4096)
 }
 
 /// Detect if a sorted sequence of values follows a geometric progression (ratio ~constant).
 fn is_geometric(vals: &[u32]) -> bool {
-    if vals.len() < 4 { return false; }
-    let ratios: Vec<f64> = vals.windows(2)
+    if vals.len() < 4 {
+        return false;
+    }
+    let ratios: Vec<f64> = vals
+        .windows(2)
         .filter(|w| w[0] > 0)
         .map(|w| w[1] as f64 / w[0] as f64)
         .collect();
-    if ratios.is_empty() { return false; }
+    if ratios.is_empty() {
+        return false;
+    }
     let mean_r = ratios.iter().sum::<f64>() / ratios.len() as f64;
-    if mean_r < 1.5 { return false; } // not growing fast enough
+    if mean_r < 1.5 {
+        return false;
+    } // not growing fast enough
     let cv = {
         let var = ratios.iter().map(|r| (r - mean_r).powi(2)).sum::<f64>() / ratios.len() as f64;
         var.sqrt() / mean_r
@@ -61,14 +71,20 @@ fn is_geometric(vals: &[u32]) -> bool {
 
 /// Detect if a sorted sequence of values follows an arithmetic progression (diff ~constant).
 fn is_arithmetic(vals: &[u32]) -> bool {
-    if vals.len() < 4 { return false; }
-    let diffs: Vec<i64> = vals.windows(2)
-        .map(|w| w[1] as i64 - w[0] as i64)
-        .collect();
+    if vals.len() < 4 {
+        return false;
+    }
+    let diffs: Vec<i64> = vals.windows(2).map(|w| w[1] as i64 - w[0] as i64).collect();
     let mean_d = diffs.iter().sum::<i64>() as f64 / diffs.len() as f64;
-    if mean_d <= 0.0 { return false; }
+    if mean_d <= 0.0 {
+        return false;
+    }
     let cv = {
-        let var = diffs.iter().map(|d| (*d as f64 - mean_d).powi(2)).sum::<f64>() / diffs.len() as f64;
+        let var = diffs
+            .iter()
+            .map(|d| (*d as f64 - mean_d).powi(2))
+            .sum::<f64>()
+            / diffs.len() as f64;
         var.sqrt() / mean_d
     };
     cv < 0.20
@@ -84,21 +100,29 @@ pub async fn analyze(event: &ApiEvent, store: &StateStore) -> Option<DetectionSi
         w.events.iter().filter_map(|e| e.max_tokens).collect()
     };
 
-    if token_seq.len() < MIN_SAMPLES { return None; }
+    if token_seq.len() < MIN_SAMPLES {
+        return None;
+    }
 
     let mut score = 0.0f32;
     let mut evidence = Vec::new();
 
     // ── 1. Greedy budget detection ────────────────────────────────────────────
-    let greedy_count = token_seq.iter().filter(|&&t| {
-        let model_max = nearest_model_max(t);
-        t as f32 / model_max as f32 >= GREEDY_THRESHOLD
-    }).count();
+    let greedy_count = token_seq
+        .iter()
+        .filter(|&&t| {
+            let model_max = nearest_model_max(t);
+            t as f32 / model_max as f32 >= GREEDY_THRESHOLD
+        })
+        .count();
 
     let greedy_frac = greedy_count as f32 / token_seq.len() as f32;
     if greedy_frac >= 0.70 {
         score += 0.30;
-        evidence.push(format!("greedy_budget:{:.0}%_requests_at_max", greedy_frac * 100.0));
+        evidence.push(format!(
+            "greedy_budget:{:.0}%_requests_at_max",
+            greedy_frac * 100.0
+        ));
     }
 
     // ── 2. Systematic sweep detection ─────────────────────────────────────────
@@ -123,25 +147,33 @@ pub async fn analyze(event: &ApiEvent, store: &StateStore) -> Option<DetectionSi
         evidence.push(format!("high_median_tokens:{}", median));
     }
 
-    if score < 0.20 { return None; }
+    if score < 0.20 {
+        return None;
+    }
 
     let confidence = if evidence.len() >= 2 { 0.82 } else { 0.60 };
 
     let mut meta = HashMap::new();
-    meta.insert("n_samples".to_string(),
-        serde_json::Value::Number(serde_json::Number::from(token_seq.len() as u64)));
-    meta.insert("median_max_tokens".to_string(),
-        serde_json::Value::Number(serde_json::Number::from(median as u64)));
-    meta.insert("distinct_values".to_string(),
-        serde_json::Value::Number(serde_json::Number::from(sorted.len() as u64)));
+    meta.insert(
+        "n_samples".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(token_seq.len() as u64)),
+    );
+    meta.insert(
+        "median_max_tokens".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(median as u64)),
+    );
+    meta.insert(
+        "distinct_values".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(sorted.len() as u64)),
+    );
 
     Some(DetectionSignal {
-        worker:     WorkerKind::TokenBudget,
+        worker: WorkerKind::TokenBudget,
         account_id: event.account_id.clone(),
-        score:      score.min(1.0),
+        score: score.min(1.0),
         confidence,
         evidence,
         meta,
-        timestamp:  Utc::now(),
+        timestamp: Utc::now(),
     })
 }

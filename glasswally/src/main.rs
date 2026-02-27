@@ -27,7 +27,9 @@ use tracing_subscriber::EnvFilter;
 mod engine;
 mod events;
 mod http_reconstruct;
+mod ioc_feed;
 mod loader;
+mod redteam;
 mod state;
 mod workers;
 

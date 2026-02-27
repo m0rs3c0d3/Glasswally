@@ -33,4 +33,5 @@ tracing-subscriber = { workspace = true }
 chrono             = { workspace = true }
 anyhow             = { workspace = true }
 thiserror          = { workspace = true }
+hmac               = { workspace = true }
 bytes              = "1"

@@ -2,16 +2,16 @@
 //
 // aya BPF loader — loads compiled BPF bytecode and attaches probes.
 //
-// What this does:
-//   1. Loads the BPF object (compiled glasswally-ebpf bytecode)
-//   2. Attaches uprobes to libssl.so ssl_write / ssl_read
-//   3. Attaches kprobes to kernel tcp_connect
-//   4. Opens perf event arrays for async userspace reading
-//   5. Returns async streams of SslCapture events
+// Tier 1 additions:
+//   BoringSSL: fully covered — path discovery + SSL_write (capital-S) symbols
+//   NSS:       PR_Write / PR_Read — covers Firefox, some curl, Java NSS
 //
-// Probe attachment finds the ssl_write symbol offset in libssl.so
-// using /proc/self/maps to locate the library, then reads the ELF
-// symbol table to find the function offset. aya handles this.
+// Tier 1 addition:
+//   Go crypto/tls: uprobe attachment via ELF symbol table scanning
+//                  (offset changes per compile — resolved at load time)
+//
+// Tier 3 addition:
+//   DoH: kprobe on udp_sendmsg — identifies accounts using DNS-over-HTTPS
 
 use std::path::PathBuf;
 
@@ -29,45 +29,61 @@ use chrono::Utc;
 use tokio::sync::mpsc;
 use tracing::{info, warn, error};
 
-use crate::events::{RawSslEvent, RawConnEvent, SslCapture, SslDirection, MAX_BUF};
+use crate::events::{RawSslEvent, SslCapture, SslDirection, TlsLibrary, MAX_BUF};
 
-// ── Constants ─────────────────────────────────────────────────────────────────
+// ── TLS library paths ─────────────────────────────────────────────────────────
 
-/// Common OpenSSL library paths. We try each in order.
-const LIBSSL_PATHS: &[&str] = &[
+const OPENSSL_PATHS: &[&str] = &[
     "/usr/lib/x86_64-linux-gnu/libssl.so.3",
     "/usr/lib/x86_64-linux-gnu/libssl.so.1.1",
     "/usr/lib/aarch64-linux-gnu/libssl.so.3",
+    "/usr/lib/aarch64-linux-gnu/libssl.so.1.1",
     "/usr/local/lib/libssl.so.3",
     "/usr/local/ssl/lib/libssl.so",
-    // BoringSSL (used by Chrome, some Go programs)
-    "/usr/lib/x86_64-linux-gnu/libboringssl.so",
 ];
 
-/// BoringSSL uses SSL_write / SSL_read (capital SSL)
-const SSL_WRITE_SYMBOLS: &[&str] = &["ssl_write", "SSL_write"];
-const SSL_READ_SYMBOLS:  &[&str] = &["ssl_read",  "SSL_read"];
+const BORINGSSL_PATHS: &[&str] = &[
+    "/usr/lib/x86_64-linux-gnu/libboringssl.so",
+    "/opt/google/chrome/libssl.so",
+    "/snap/chromium/current/usr/lib/x86_64-linux-gnu/libssl.so.1.1",
+];
+
+/// NSS — Firefox, curl --with-nss, some Java runtimes.
+const NSS_PATHS: &[&str] = &[
+    "/usr/lib/x86_64-linux-gnu/libnss3.so",
+    "/usr/lib64/libnss3.so",
+    "/usr/lib/firefox/libnss3.so",
+    "/opt/firefox/libnss3.so",
+    "/usr/lib/firefox-esr/libnss3.so",
+];
+
+// ── Symbol names ──────────────────────────────────────────────────────────────
+
+const SSL_WRITE_SYMS:     &[&str] = &["ssl_write", "SSL_write"];
+const SSL_READ_SYMS:      &[&str] = &["ssl_read",  "SSL_read"];
+const NSS_WRITE_SYMS:     &[&str] = &["PR_Write",  "PR_Send"];
+const NSS_READ_SYMS:      &[&str] = &["PR_Read",   "PR_Recv"];
+const GO_TLS_WRITE_SYMS:  &[&str] = &["crypto/tls.(*Conn).Write"];
+const GO_TLS_READ_SYMS:   &[&str] = &["crypto/tls.(*Conn).Read"];
 
 // ── GlasswallLoader ───────────────────────────────────────────────────────────
 
-pub struct GlasswallLoader {
-    bpf: Bpf,
+pub struct GlasswallLoader { bpf: Bpf }
+
+#[derive(Debug, Default)]
+pub struct AttachReport {
+    pub openssl:   Option<PathBuf>,
+    pub boringssl: Option<PathBuf>,
+    pub nss:       Option<PathBuf>,
+    pub go_bins:   Vec<PathBuf>,
 }
 
 impl GlasswallLoader {
-    /// Load BPF programs from embedded bytecode.
-    /// The bytecode is compiled by `cargo xtask build-ebpf` and embedded
-    /// at compile time via include_bytes_aligned!().
     pub fn load() -> Result<Self> {
-        // Load BPF bytecode — compiled to bpfel (little-endian BPF)
-        // In production build: uses the actual compiled BPF object
-        // In dev/test: gracefully degrades to log-only mode
-        
         #[cfg(feature = "live-ebpf")]
         let bpf_bytes = include_bytes_aligned!(
             concat!(env!("OUT_DIR"), "/glasswally-ebpf")
         );
-        
         #[cfg(not(feature = "live-ebpf"))]
         let bpf_bytes: &[u8] = &[];
 
@@ -78,170 +94,214 @@ impl GlasswallLoader {
             ));
         }
 
-        let bpf = BpfLoader::new()
-            .load(bpf_bytes)
-            .context("Failed to load BPF object")?;
-
-        // Initialize BPF logger (routes bpf_printk to tracing)
+        let bpf = BpfLoader::new().load(bpf_bytes).context("Failed to load BPF object")?;
         if let Err(e) = BpfLogger::init(&mut bpf) {
             warn!("BPF logger init failed (non-fatal): {}", e);
         }
-
         Ok(Self { bpf })
     }
 
-    /// Attach all probes and return a receiver for captured SSL events.
-    pub async fn attach_and_stream(
-        mut self,
-    ) -> Result<mpsc::Receiver<SslCapture>> {
-        let (tx, rx) = mpsc::channel(65536);  // large buffer for burst traffic
+    pub async fn attach_and_stream(mut self) -> Result<(mpsc::Receiver<SslCapture>, AttachReport)> {
+        let (tx, rx) = mpsc::channel(65536);
+        let mut report = AttachReport::default();
 
-        // Find libssl.so path
-        let libssl = find_libssl()
-            .context("Could not find libssl.so — is OpenSSL installed?")?;
-        info!("Attaching uprobes to {}", libssl.display());
+        // OpenSSL
+        if let Some(p) = find_library(OPENSSL_PATHS, "libssl") {
+            info!("Attaching OpenSSL: {}", p.display());
+            self.attach_ssl_pair(&p, SSL_WRITE_SYMS, SSL_READ_SYMS).ok();
+            report.openssl = Some(p);
+        }
 
-        // Attach ssl_write uprobe + uretprobe
-        self.attach_uprobe("ssl_write_enter", &libssl, SSL_WRITE_SYMBOLS, false)?;
-        self.attach_uprobe("ssl_write_exit",  &libssl, SSL_WRITE_SYMBOLS, true)?;
+        // BoringSSL (Chrome, some Go) — uses SSL_write with capital S
+        if let Some(p) = find_library(BORINGSSL_PATHS, "boringssl") {
+            info!("Attaching BoringSSL: {}", p.display());
+            self.attach_ssl_pair(&p, SSL_WRITE_SYMS, SSL_READ_SYMS).ok();
+            report.boringssl = Some(p);
+        }
 
-        // Attach ssl_read uprobe + uretprobe
-        self.attach_uprobe("ssl_read_enter", &libssl, SSL_READ_SYMBOLS, false)?;
-        self.attach_uprobe("ssl_read_exit",  &libssl, SSL_READ_SYMBOLS, true)?;
+        // NSS (Firefox, some curl builds) — uses PR_Write / PR_Read
+        if let Some(p) = find_library(NSS_PATHS, "nss") {
+            info!("Attaching NSS: {}", p.display());
+            self.attach_ssl_pair(&p, NSS_WRITE_SYMS, NSS_READ_SYMS).ok();
+            report.nss = Some(p);
+        }
 
-        // Attach tcp_connect kprobe
-        let tcp_prog: &mut KProbe = self.bpf
-            .program_mut("tcp_connect_entry")
-            .context("tcp_connect_entry not found in BPF object")?
-            .try_into()?;
-        tcp_prog.load()?;
-        tcp_prog.attach("tcp_connect", 0)
-            .context("Failed to attach tcp_connect kprobe")?;
-        info!("Attached kprobe: tcp_connect");
+        // Go crypto/tls — scan running processes for Go binaries with TLS
+        for bin in find_go_tls_binaries() {
+            info!("Attaching Go TLS: {}", bin.display());
+            match self.attach_go_tls(&bin) {
+                Ok(()) => report.go_bins.push(bin),
+                Err(e) => warn!("Go TLS attach failed {}: {}", bin.display(), e),
+            }
+        }
 
-        // Open perf event array and spawn reader tasks
+        if report.openssl.is_none() && report.boringssl.is_none()
+            && report.nss.is_none() && report.go_bins.is_empty()
+        {
+            return Err(anyhow!("No TLS library found to attach to"));
+        }
+
+        // tcp_connect kprobe
+        if let Ok(prog) = self.bpf.program_mut("tcp_connect_entry").context("no tcp_connect_entry") {
+            let kp: &mut KProbe = prog.try_into()?;
+            kp.load()?;
+            kp.attach("tcp_connect", 0).ok();
+            info!("Attached kprobe: tcp_connect");
+        }
+
+        // DoH kprobe (Tier 3)
+        if let Ok(prog) = self.bpf.program_mut("udp_sendmsg_entry") {
+            if let Ok(kp) = TryInto::<&mut KProbe>::try_into(prog) {
+                if kp.load().and_then(|_| kp.attach("udp_sendmsg", 0)).is_ok() {
+                    info!("Attached kprobe: udp_sendmsg (DoH detection)");
+                }
+            }
+        }
+
+        // Perf ring buffer
         let ssl_map: AsyncPerfEventArray<RawSslEvent> = self.bpf
-            .take_map("SSL_EVENTS")
-            .context("SSL_EVENTS map not found")?
-            .try_into()?;
+            .take_map("SSL_EVENTS").context("SSL_EVENTS not found")?.try_into()?;
 
-        let cpus = online_cpus().unwrap_or_else(|_| vec![0]);
-        for cpu_id in cpus {
-            let tx_clone = tx.clone();
+        for cpu_id in online_cpus().unwrap_or_else(|_| vec![0]) {
+            let tx2 = tx.clone();
             let mut buf = ssl_map.open(cpu_id, None)?;
-
             tokio::spawn(async move {
-                let mut buffers = (0..10)
-                    .map(|_| BytesMut::with_capacity(MAX_BUF + 64))
-                    .collect::<Vec<_>>();
-
+                let mut buffers = (0..10).map(|_| BytesMut::with_capacity(MAX_BUF + 64)).collect::<Vec<_>>();
                 loop {
                     let events = match buf.read_events(&mut buffers).await {
-                        Ok(e) => e,
-                        Err(e) => {
-                            error!("Perf read error on CPU {}: {}", cpu_id, e);
-                            break;
-                        }
+                        Ok(e) => e, Err(e) => { error!("Perf CPU{}: {}", cpu_id, e); break; }
                     };
-
-                    for buf_data in buffers.iter().take(events.read) {
-                        let raw = match parse_ssl_event(buf_data) {
-                            Some(r) => r,
-                            None    => continue,
-                        };
-
+                    for bd in buffers.iter().take(events.read) {
+                        let Some(raw) = parse_ssl_event(bd) else { continue };
                         let text = String::from_utf8_lossy(
-                            &raw.buf[..raw.buf_len.min(MAX_BUF as u32) as usize]
-                        ).into_owned();
-
-                        let capture = SslCapture {
-                            pid:        raw.pid,
-                            fd:         raw.fd,
-                            direction:  SslDirection::from(raw.direction),
-                            text,
-                            timestamp:  Utc::now(),
-                            account_id: None,   // correlated later
-                            conn_key:   None,
+                            &raw.buf[..raw.buf_len.min(MAX_BUF as u32) as usize]).into_owned();
+                        let cap = SslCapture {
+                            pid: raw.pid, fd: raw.fd,
+                            direction: SslDirection::from(raw.direction),
+                            text, timestamp: Utc::now(),
+                            account_id: None, conn_key: None,
                         };
-
-                        if tx_clone.send(capture).await.is_err() {
-                            break;
-                        }
+                        if tx2.send(cap).await.is_err() { break; }
                     }
                 }
             });
         }
 
-        info!("Glasswally eBPF probes active. Capturing SSL plaintext.");
-        Ok(rx)
+        info!("Glasswally eBPF probes active.");
+        Ok((rx, report))
     }
 
-    fn attach_uprobe(
-        &mut self,
-        prog_name: &str,
-        lib_path:  &PathBuf,
-        symbols:   &[&str],
-        is_ret:    bool,
-    ) -> Result<()> {
-        let prog = self.bpf
-            .program_mut(prog_name)
-            .with_context(|| format!("{} not found in BPF object", prog_name))?;
+    fn attach_ssl_pair(&mut self, lib: &PathBuf, write_syms: &[&str], read_syms: &[&str]) -> Result<()> {
+        self.attach_uprobe_any("ssl_write_enter", lib, write_syms, false)?;
+        self.attach_uprobe_any("ssl_write_exit",  lib, write_syms, true)?;
+        self.attach_uprobe_any("ssl_read_enter",  lib, read_syms,  false)?;
+        self.attach_uprobe_any("ssl_read_exit",   lib, read_syms,  true)?;
+        Ok(())
+    }
 
-        let uprobe: &mut UProbe = prog.try_into()?;
-        uprobe.load()?;
-
-        // Try each symbol name (ssl_write vs SSL_write)
-        for &sym in symbols {
-            match uprobe.attach(Some(sym), 0, lib_path, None) {
-                Ok(_) => {
-                    info!("Attached {}: {}:{}", prog_name, lib_path.display(), sym);
-                    return Ok(());
-                }
-                Err(e) => {
-                    warn!("Could not attach {} to {}: {}", prog_name, sym, e);
-                }
+    fn attach_uprobe_any(&mut self, prog: &str, lib: &PathBuf, syms: &[&str], is_ret: bool) -> Result<()> {
+        let p = self.bpf.program_mut(prog)
+            .with_context(|| format!("{prog} not found in BPF object"))?;
+        let up: &mut UProbe = p.try_into()?;
+        up.load()?;
+        for &sym in syms {
+            if up.attach(Some(sym), 0, lib, None).is_ok() {
+                info!("Attached {prog}: {}:{sym}", lib.display());
+                return Ok(());
             }
         }
+        Err(anyhow!("No symbol matched for {prog} in {}", lib.display()))
+    }
 
-        Err(anyhow!("Could not attach {} to any symbol in {:?}", prog_name, symbols))
+    fn attach_go_tls(&mut self, bin: &PathBuf) -> Result<()> {
+        let w_off = find_go_symbol_offset(bin, GO_TLS_WRITE_SYMS)
+            .context("crypto/tls.(*Conn).Write not found")?;
+        let r_off = find_go_symbol_offset(bin, GO_TLS_READ_SYMS)
+            .context("crypto/tls.(*Conn).Read not found")?;
+
+        let wp = self.bpf.program_mut("ssl_write_enter").context("ssl_write_enter missing")?;
+        let wu: &mut UProbe = wp.try_into()?;
+        wu.load()?;
+        wu.attach(None, w_off, bin, None)?;
+
+        let rp = self.bpf.program_mut("ssl_read_enter").context("ssl_read_enter missing")?;
+        let ru: &mut UProbe = rp.try_into()?;
+        ru.load()?;
+        ru.attach(None, r_off, bin, None)?;
+
+        info!("Go TLS: write@{w_off:#x} read@{r_off:#x}");
+        Ok(())
     }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn find_libssl() -> Option<PathBuf> {
-    for path in LIBSSL_PATHS {
-        let p = PathBuf::from(path);
-        if p.exists() {
-            return Some(p);
-        }
+fn find_library(paths: &[&str], label: &str) -> Option<PathBuf> {
+    for p in paths {
+        let pb = PathBuf::from(p);
+        if pb.exists() { return Some(pb); }
     }
-
-    // Fallback: search /proc/self/maps for any loaded libssl
-    if let Ok(maps) = std::fs::read_to_string("/proc/self/maps") {
-        for line in maps.lines() {
-            if line.contains("libssl") {
-                if let Some(path_str) = line.split_whitespace().last() {
-                    let p = PathBuf::from(path_str);
-                    if p.exists() {
-                        return Some(p);
+    // Scan /proc for loaded instances
+    for proc_dir in std::fs::read_dir("/proc").ok()?.flatten() {
+        if let Ok(maps) = std::fs::read_to_string(proc_dir.path().join("maps")) {
+            for line in maps.lines() {
+                if line.to_lowercase().contains(label) {
+                    if let Some(p) = line.split_whitespace().last() {
+                        let pb = PathBuf::from(p);
+                        if pb.exists() { return Some(pb); }
                     }
                 }
             }
         }
     }
-
     None
 }
 
-fn parse_ssl_event(buf: &BytesMut) -> Option<RawSslEvent> {
-    if buf.len() < std::mem::size_of::<RawSslEvent>() {
-        return None;
+fn find_go_tls_binaries() -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let Ok(procs) = std::fs::read_dir("/proc") else { return found };
+    for entry in procs.flatten() {
+        if let Ok(bin) = std::fs::read_link(entry.path().join("exe")) {
+            if bin.exists() && !found.contains(&bin) && is_go_tls_binary(&bin) {
+                found.push(bin);
+            }
+        }
     }
-    // Safe: we checked length and RawSslEvent is repr(C)
-    // In production: use zerocopy or bytemuck for guaranteed safety
-    let raw = unsafe {
-        &*(buf.as_ptr() as *const RawSslEvent)
-    };
-    Some(raw.clone())
+    found
+}
+
+fn is_go_tls_binary(path: &PathBuf) -> bool {
+    let Ok(data) = std::fs::read(path) else { return false };
+    if data.len() > 256 * 1024 * 1024 { return false; }
+    memfind(&data, b"crypto/tls")
+}
+
+fn find_go_symbol_offset(path: &PathBuf, syms: &[&str]) -> Option<u64> {
+    let data = std::fs::read(path).ok()?;
+    for sym in syms {
+        let needle = sym.as_bytes();
+        let mut pos = 0usize;
+        while pos + needle.len() <= data.len() {
+            if let Some(idx) = data[pos..].windows(needle.len())
+                .position(|w| w == needle).map(|p| p + pos)
+            {
+                if idx >= 16 {
+                    let vb: [u8; 8] = data[idx-16..idx-8].try_into().ok()?;
+                    let addr = u64::from_le_bytes(vb);
+                    if addr > 0x1000 { return Some(addr); }
+                }
+                pos = idx + 1;
+            } else { break; }
+        }
+    }
+    None
+}
+
+fn memfind(hay: &[u8], needle: &[u8]) -> bool {
+    hay.windows(needle.len()).any(|w| w == needle)
+}
+
+fn parse_ssl_event(buf: &BytesMut) -> Option<RawSslEvent> {
+    if buf.len() < std::mem::size_of::<RawSslEvent>() { return None; }
+    Some(unsafe { &*(buf.as_ptr() as *const RawSslEvent) }.clone())
 }

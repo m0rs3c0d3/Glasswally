@@ -1,5 +1,7 @@
 # Glasswally
 
+[![CI](https://github.com/m0rs3c0d3/Glasswally/actions/workflows/ci.yml/badge.svg)](https://github.com/m0rs3c0d3/Glasswally/actions/workflows/ci.yml)
+
 **Real-time LLM distillation attack detection via eBPF**
 
 Glasswally detects industrial-scale model distillation campaigns — where adversaries use thousands of coordinated accounts to systematically extract AI model capabilities — using a multi-signal detection pipeline with a Rust/tokio hot path and eBPF kernel instrumentation.
@@ -29,15 +31,28 @@ This also directly counters **[Fingerprint Suite](https://github.com/apify/finge
 
 ## Detection Signals
 
-| Worker | Signal | Catches |
-|---|---|---|
-| `fingerprint` | JA3 hash + HTTP header order entropy | Fingerprint Suite, UA spoofing |
-| `velocity` | RPH, timing regularity (Kendall tau), token CV | Scripted automation |
-| `cot` | Aho-Corasick pattern match (33 patterns) | DeepSeek CoT extraction |
-| `hydra` | Graph cluster via shared payment/IP/subnet | Hydra proxy networks |
-| `pivot` | Coordinated model version switch | MiniMax-style pivot behavior |
+16 workers run concurrently via `tokio::join!` on every event:
 
-Signals are fused with a weighted ensemble (fingerprint 30%, velocity 23%, CoT 23%, hydra 14%, pivot 10%) with geo uplift for restricted regions and cluster-level floor raising.
+| Worker | Weight | Signal | Catches |
+|---|---|---|---|
+| `fingerprint` | 14% | JA3 hash + JA3S + HTTP header order entropy | Fingerprint Suite, UA spoofing |
+| `velocity` | 10% | RPH, timing regularity (Kendall tau), token CV | Scripted automation |
+| `cot` | 9% | Aho-Corasick pattern match (33 patterns) | DeepSeek CoT extraction |
+| `embed` | 8% | Semantic embedding similarity | CoT paraphrasing / reworded extraction |
+| `hydra` | 8% | Graph cluster via shared payment/IP/subnet | Hydra proxy networks |
+| `timing_cluster` | 7% | Cross-account synchronized burst detection | Coordinated bot swarms |
+| `asn_classifier` | 7% | Datacenter/cloud provider ASN classification | Cloud batch inference jobs |
+| `h2_grpc` | 6% | HTTP/2 SETTINGS fingerprint + gRPC stream analysis | gRPC-based automation |
+| `role_preamble` | 6% | System prompt hash stability + cross-account collisions | Template-reuse extraction rigs |
+| `pivot` | 5% | Coordinated model version switch | MiniMax-style pivot behavior |
+| `biometric` | 5% | Prompt sequence entropy + inter-arrival jitter | Human-mimicry bots |
+| `watermark` | 4% | Watermark probe / zero-width character detection | Watermark extraction attempts |
+| `session_gap` | 4% | Inter-session gap CV (cron regularity detection) | Cron-scheduled batch jobs |
+| `token_budget` | 3% | max_tokens sweep / greedy budget probing | Capability boundary mapping |
+| `refusal_probe` | 2% | Refusal-elicitation keyword density + category sweep | Safety boundary mapping |
+| `sequence_model` | 2% | Markov chain over prompt topic transitions | Systematic capability traversal |
+
+Signals are fused with a weighted ensemble (weights above sum to 1.00) with geo uplift for restricted regions and cluster-level floor raising.
 
 ---
 
@@ -163,7 +178,10 @@ glasswally/
 │   │   ├── events.rs       all shared types
 │   │   ├── http_reconstruct.rs  HTTP/1.1 reconstruction from SSL captures
 │   │   ├── state/window.rs lock-free sliding windows (DashMap)
-│   │   ├── workers/        detection workers (velocity, CoT, fingerprint, hydra, pivot)
+│   │   ├── workers/        16 detection workers (fingerprint, velocity, cot, embed, hydra,
+│   │   │                   timing_cluster, asn_classifier, h2_grpc, role_preamble, pivot,
+│   │   │                   biometric, watermark, session_gap, token_budget, refusal_probe,
+│   │   │                   sequence_model)
 │   │   └── engine/         signal fusion + enforcement dispatcher
 │   └── build.rs            embeds BPF bytecode at compile time
 ├── xtask/                  build tooling (cargo xtask build-ebpf)

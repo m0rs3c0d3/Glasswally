@@ -5,9 +5,11 @@
 //
 // Design:
 //   - Per-account event ring buffer (VecDeque, auto-expiring)
-//   - Infrastructure indexes: payment → accounts, subnet → accounts
+//   - Infrastructure reverse indexes: payment → accounts, subnet → accounts
 //   - Relationship graph: accounts as nodes, shared infra as edges
 //   - Cluster membership: connected components with 3+ accounts
+//   - Timing buckets: second-resolution global burst detection
+//   - Canary registry: per-account watermark + canary token tracking
 //
 // This is the in-memory equivalent of:
 //   Redis     → per-account state
@@ -21,11 +23,9 @@ use std::sync::Arc;
 use chrono::{DateTime, Duration, Utc};
 use dashmap::DashMap;
 use parking_lot::RwLock;
-use petgraph::graph::{NodeIndex, UnGraph};
-use petgraph::algo::connected_components;
 use tracing::debug;
 
-use crate::events::ApiEvent;
+use crate::events::{ApiEvent, CanaryToken};
 
 // ── Window durations ──────────────────────────────────────────────────────────
 
@@ -48,28 +48,34 @@ pub struct AccountWindow {
     pub org_ids:        HashSet<String>,
     pub models_seen:    Vec<(DateTime<Utc>, String)>,
     pub header_hashes:  HashSet<String>,   // header order hashes
-    pub ja3_hashes:     HashSet<String>,   // TLS fingerprints seen
+    pub ja3_hashes:     HashSet<String>,   // TLS ClientHello fingerprints
+    pub ja3s_hashes:    HashSet<String>,   // TLS ServerHello fingerprints (Tier 1)
+    pub h2_fingerprints:HashSet<String>,   // HTTP/2 SETTINGS fingerprints (Tier 2)
     pub suspended:      bool,
     pub last_alerted:   Option<DateTime<Utc>>,
+    pub watermarked_at: Option<DateTime<Utc>>, // when account was first watermarked
 }
 
 impl AccountWindow {
     pub fn new(account_id: &str, now: DateTime<Utc>) -> Self {
         Self {
-            account_id:     account_id.to_string(),
-            events:         VecDeque::new(),
-            first_seen:     now,
-            last_seen:      now,
-            ip_addresses:   HashSet::new(),
-            payment_hashes: HashSet::new(),
-            user_agents:    HashSet::new(),
-            country_codes:  HashSet::new(),
-            org_ids:        HashSet::new(),
-            models_seen:    Vec::new(),
-            header_hashes:  HashSet::new(),
-            ja3_hashes:     HashSet::new(),
-            suspended:      false,
-            last_alerted:   None,
+            account_id:      account_id.to_string(),
+            events:          VecDeque::new(),
+            first_seen:      now,
+            last_seen:       now,
+            ip_addresses:    HashSet::new(),
+            payment_hashes:  HashSet::new(),
+            user_agents:     HashSet::new(),
+            country_codes:   HashSet::new(),
+            org_ids:         HashSet::new(),
+            models_seen:     Vec::new(),
+            header_hashes:   HashSet::new(),
+            ja3_hashes:      HashSet::new(),
+            ja3s_hashes:     HashSet::new(),
+            h2_fingerprints: HashSet::new(),
+            suspended:       false,
+            last_alerted:    None,
+            watermarked_at:  None,
         }
     }
 
@@ -86,6 +92,14 @@ impl AccountWindow {
         }
         if let Some(ref ja3) = event.ja3_hash {
             self.ja3_hashes.insert(ja3.clone());
+        }
+        if let Some(ref ja3s) = event.ja3s_hash {
+            self.ja3s_hashes.insert(ja3s.clone());
+        }
+        if let Some(ref h2) = event.h2_settings {
+            if !h2.fingerprint.is_empty() {
+                self.h2_fingerprints.insert(h2.fingerprint.clone());
+            }
         }
         // Header order hash
         if !event.header_order.is_empty() {
@@ -148,11 +162,12 @@ pub struct StateStore {
     pub accounts: DashMap<String, Arc<RwLock<AccountWindow>>>,
 
     // Infrastructure reverse indexes — fast cluster detection
-    payment_idx: DashMap<String, HashSet<String>>,  // payment_hash → account_ids
-    subnet_idx:  DashMap<String, HashSet<String>>,  // subnet → account_ids
-    org_idx:     DashMap<String, HashSet<String>>,  // org_id → account_ids
-    ja3_idx:     DashMap<String, HashSet<String>>,  // ja3_hash → account_ids
-    hdr_idx:     DashMap<String, HashSet<String>>,  // header_hash → account_ids
+    payment_idx:  DashMap<String, HashSet<String>>,  // payment_hash → account_ids
+    subnet_idx:   DashMap<String, HashSet<String>>,  // subnet → account_ids
+    org_idx:      DashMap<String, HashSet<String>>,  // org_id → account_ids
+    ja3_idx:      DashMap<String, HashSet<String>>,  // ja3_hash → account_ids
+    ja3s_idx:     DashMap<String, HashSet<String>>,  // ja3s_hash → account_ids
+    hdr_idx:      DashMap<String, HashSet<String>>,  // header_hash → account_ids
 
     // Cluster assignments (updated incrementally on each new edge)
     pub account_cluster: DashMap<String, u32>,
@@ -162,6 +177,16 @@ pub struct StateStore {
     // Model pivot tracking
     model_switches: DashMap<String, Vec<(DateTime<Utc>, String, String)>>,
 
+    // Cross-account timing buckets (Tier 1 — synchronized burst detection)
+    // Key = Unix timestamp in seconds, Value = set of account_ids that fired in that second
+    timing_buckets: DashMap<u64, HashSet<String>>,
+
+    // Canary token registry (Tier 2 — response attribution)
+    canary_registry: DashMap<String, CanaryToken>,  // token → metadata
+
+    // Watermark tracking — accounts under active watermark surveillance
+    watermarked: DashMap<String, DateTime<Utc>>,  // account_id → watermark start time
+
     // Global counters
     pub total_events:   std::sync::atomic::AtomicU64,
     pub total_accounts: std::sync::atomic::AtomicU64,
@@ -170,18 +195,22 @@ pub struct StateStore {
 impl StateStore {
     pub fn new() -> Self {
         Self {
-            accounts:       DashMap::new(),
-            payment_idx:    DashMap::new(),
-            subnet_idx:     DashMap::new(),
-            org_idx:        DashMap::new(),
-            ja3_idx:        DashMap::new(),
-            hdr_idx:        DashMap::new(),
-            account_cluster:DashMap::new(),
-            clusters:       DashMap::new(),
-            next_cluster:   parking_lot::Mutex::new(0),
-            model_switches: DashMap::new(),
-            total_events:   std::sync::atomic::AtomicU64::new(0),
-            total_accounts: std::sync::atomic::AtomicU64::new(0),
+            accounts:        DashMap::new(),
+            payment_idx:     DashMap::new(),
+            subnet_idx:      DashMap::new(),
+            org_idx:         DashMap::new(),
+            ja3_idx:         DashMap::new(),
+            ja3s_idx:        DashMap::new(),
+            hdr_idx:         DashMap::new(),
+            account_cluster: DashMap::new(),
+            clusters:        DashMap::new(),
+            next_cluster:    parking_lot::Mutex::new(0),
+            model_switches:  DashMap::new(),
+            timing_buckets:  DashMap::new(),
+            canary_registry: DashMap::new(),
+            watermarked:     DashMap::new(),
+            total_events:    std::sync::atomic::AtomicU64::new(0),
+            total_accounts:  std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -226,9 +255,19 @@ impl StateStore {
         if let Some(ref ja3) = event.ja3_hash {
             self.ja3_idx.entry(ja3.clone()).or_default().insert(event.account_id.clone());
         }
+        if let Some(ref ja3s) = event.ja3s_hash {
+            self.ja3s_idx.entry(ja3s.clone()).or_default().insert(event.account_id.clone());
+        }
         for subnet in window.read().subnets() {
             self.subnet_idx.entry(subnet).or_default().insert(event.account_id.clone());
         }
+
+        // Record global timing bucket (for cross-account burst detection)
+        let bucket = event.timestamp.timestamp() as u64;
+        self.timing_buckets
+            .entry(bucket)
+            .or_default()
+            .insert(event.account_id.clone());
 
         // Trigger incremental cluster update
         self.update_clusters(&event.account_id);
@@ -328,6 +367,10 @@ impl StateStore {
         self.ja3_idx.get(ja3).map(|a| a.clone()).unwrap_or_default()
     }
 
+    pub fn accounts_with_ja3s(&self, ja3s: &str) -> HashSet<String> {
+        self.ja3s_idx.get(ja3s).map(|a| a.clone()).unwrap_or_default()
+    }
+
     pub fn accounts_with_header_hash(&self, hash: &str) -> HashSet<String> {
         self.hdr_idx.get(hash).map(|a| a.clone()).unwrap_or_default()
     }
@@ -335,14 +378,70 @@ impl StateStore {
     pub fn n_accounts(&self) -> usize { self.accounts.len() }
     pub fn n_clusters(&self) -> usize { self.clusters.len() }
 
+    // ── Timing bucket queries (Tier 1 — cross-account burst detection) ────────
+
+    /// Record that account fired at the given Unix-second bucket.
+    pub fn record_timing(&self, account_id: &str, bucket: u64) {
+        self.timing_buckets
+            .entry(bucket)
+            .or_default()
+            .insert(account_id.to_string());
+    }
+
+    /// Count how many distinct accounts fired in a given 1-second bucket.
+    pub fn accounts_in_bucket(&self, bucket: u64) -> usize {
+        self.timing_buckets.get(&bucket).map(|b| b.len()).unwrap_or(0)
+    }
+
+    // ── Watermark management (Tier 1) ─────────────────────────────────────────
+
+    pub fn is_watermarked(&self, account_id: &str) -> bool {
+        self.watermarked.contains_key(account_id)
+    }
+
+    pub fn mark_watermarked(&self, account_id: &str) {
+        self.watermarked.insert(account_id.to_string(), Utc::now());
+        if let Some(w) = self.accounts.get(account_id) {
+            w.write().watermarked_at = Some(Utc::now());
+        }
+    }
+
+    // ── Canary token registry (Tier 2) ────────────────────────────────────────
+
+    pub fn register_canary(&self, token: CanaryToken) {
+        self.canary_registry.insert(token.token.clone(), token);
+    }
+
+    pub fn lookup_canary(&self, token: &str) -> Option<CanaryToken> {
+        self.canary_registry.get(token).map(|t| t.clone())
+    }
+
+    pub fn trigger_canary(&self, token: &str) {
+        if let Some(mut entry) = self.canary_registry.get_mut(token) {
+            entry.triggered   = true;
+            entry.trigger_ts  = Some(Utc::now());
+        }
+    }
+
+    pub fn triggered_canaries_for_cluster(&self, cluster_id: u32) -> Vec<String> {
+        let members = self.cluster_members(cluster_id);
+        self.canary_registry.iter()
+            .filter(|e| e.triggered && members.contains(&e.account_id))
+            .map(|e| e.token.clone())
+            .collect()
+    }
+
     // ── Housekeeping ──────────────────────────────────────────────────────────
 
     pub async fn housekeeping_loop(self: Arc<Self>) {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
+            let cutoff_secs = (Utc::now() - chrono::Duration::seconds(W_24HR)).timestamp() as u64;
             for entry in self.accounts.iter() {
                 entry.value().write().expire_old();
             }
+            // Expire old timing buckets (keep last 10 minutes)
+            self.timing_buckets.retain(|&bucket, _| bucket >= cutoff_secs.saturating_sub(600));
         }
     }
 }

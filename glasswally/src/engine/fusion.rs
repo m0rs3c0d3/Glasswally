@@ -1,7 +1,22 @@
 // glasswally/src/engine/fusion.rs
 //
 // Weighted signal fusion with geo uplift + cluster floor raise.
-// Fingerprint worker gets 30% weight — it's the highest-precision signal.
+//
+// Weight distribution across 10 workers (sum = 1.00):
+//   Fingerprint   0.20  — JA3 + JA3S + header entropy (highest precision)
+//   Velocity      0.13  — RPH / timing (complemented by TimingCluster)
+//   Cot           0.12  — Aho-Corasick patterns (complemented by Embed)
+//   Embed         0.10  — semantic similarity (catches CoT paraphrases)
+//   Hydra         0.11  — cluster graph scoring
+//   TimingCluster 0.09  — cross-account synchronized bursts
+//   H2Grpc        0.07  — HTTP/2 SETTINGS + gRPC fingerprinting
+//   Pivot         0.07  — coordinated model switch
+//   Biometric     0.06  — prompt sequence entropy
+//   Watermark     0.05  — watermark probe / ZW character detection
+//
+// Original 5-worker system: Fingerprint(30) + Velocity(23) + Cot(23) + Hydra(14) + Pivot(10)
+// The added signals are redistributed proportionally while preserving the
+// relative ordering of precision.
 
 use chrono::Utc;
 use dashmap::DashMap;
@@ -12,11 +27,16 @@ use crate::state::window::StateStore;
 
 // Signal weights — must sum to 1.0
 const WEIGHTS: &[(WorkerKind, f32)] = &[
-    (WorkerKind::Fingerprint, 0.30),
-    (WorkerKind::Velocity,    0.23),
-    (WorkerKind::Cot,         0.23),
-    (WorkerKind::Hydra,       0.14),
-    (WorkerKind::Pivot,       0.10),
+    (WorkerKind::Fingerprint,   0.20),
+    (WorkerKind::Velocity,      0.13),
+    (WorkerKind::Cot,           0.12),
+    (WorkerKind::Embed,         0.10),
+    (WorkerKind::Hydra,         0.11),
+    (WorkerKind::TimingCluster, 0.09),
+    (WorkerKind::H2Grpc,        0.07),
+    (WorkerKind::Pivot,         0.07),
+    (WorkerKind::Biometric,     0.06),
+    (WorkerKind::Watermark,     0.05),
 ];
 
 const CRITICAL: f32 = 0.72;
@@ -45,7 +65,7 @@ impl FusionEngine {
         let sig_map: HashMap<WorkerKind, &DetectionSignal> =
             signals.iter().map(|s| (s.worker, s)).collect();
 
-        let mut composite   = 0.0f32;
+        let mut composite  = 0.0f32;
         let mut sig_scores: HashMap<String, f32> = HashMap::new();
 
         for (worker, weight) in WEIGHTS {
@@ -56,7 +76,7 @@ impl FusionEngine {
             }
         }
 
-        // Geo uplift — CN access raises all signals 30%
+        // Geo uplift — CN access raises composite 30%
         if event.country_code == "CN" {
             composite = (composite * 1.30).min(1.0);
         }
@@ -74,19 +94,22 @@ impl FusionEngine {
         let (tier, action) = if composite >= CRITICAL {
             (RiskTier::Critical, ActionKind::SuspendAccount)
         } else if composite >= HIGH {
-            (RiskTier::High, ActionKind::FlagForReview)
+            // High tier: inject canary + flag for review
+            (RiskTier::High, ActionKind::InjectCanary)
         } else {
             (RiskTier::Medium, ActionKind::RateLimit)
         };
 
         let top_evidence: Vec<String> = signals.iter()
             .flat_map(|s| s.evidence.iter().cloned())
-            .filter(|e| !["cached","no_cluster","insufficient_data"].contains(&e.as_str()))
-            .take(8).collect();
+            .filter(|e| !["cached", "no_cluster", "insufficient_data", "small_cluster",
+                          "account_watermarked"].contains(&e.as_str()))
+            .take(10).collect();
 
-        let window   = store.get_window(&event.account_id);
-        let n_reqs   = window.as_ref().map(|w| w.read().events.len()).unwrap_or(0);
-        let countries= window.map(|w| w.read().country_codes.iter().cloned().collect()).unwrap_or_default();
+        let window    = store.get_window(&event.account_id);
+        let n_reqs    = window.as_ref().map(|w| w.read().events.len()).unwrap_or(0);
+        let countries = window.map(|w| w.read().country_codes.iter().cloned().collect())
+                              .unwrap_or_default();
 
         Some(RiskDecision {
             account_id:      event.account_id.clone(),

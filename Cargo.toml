@@ -34,6 +34,7 @@ aho-corasick = "1"
 md5          = "0.7"
 hex          = "0.4"
 sha2         = "0.10"
+hmac         = "0.12"
 
 # Graph
 petgraph     = "0.6"

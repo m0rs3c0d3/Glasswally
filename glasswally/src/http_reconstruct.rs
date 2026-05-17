@@ -14,6 +14,21 @@ use std::collections::HashMap;
 
 use crate::events::{HttpRequest, SslCapture, SslDirection};
 
+/// Hard cap on the size of a single in-flight (reassembling) HTTP request.
+/// Anything larger is dropped rather than buffered — prevents a monitored
+/// client from exhausting daemon memory by never completing a request.
+const MAX_REQUEST_BYTES: usize = 1024 * 1024; // 1 MiB
+
+/// Hard cap on the number of concurrently reassembling connections.
+/// Bounds the per-connection buffer map so a flood of partial requests
+/// cannot grow it without limit.
+const MAX_CONNS: usize = 8192;
+
+/// Largest Content-Length we will wait for before considering a request
+/// "complete at the header boundary". Beyond this we refuse to keep
+/// buffering for a body that will never plausibly arrive.
+const MAX_CONTENT_LENGTH: usize = 8 * 1024 * 1024; // 8 MiB
+
 // ── HTTP parser ───────────────────────────────────────────────────────────────
 
 /// Reconstruct an HTTP request from a plaintext SSL capture.
@@ -129,9 +144,11 @@ fn derive_account_id(auth: &str) -> String {
     // Extract the key part (after "Bearer " if present)
     let key = auth.trim_start_matches("Bearer ").trim();
     let mut hasher = Sha256::new();
+    hasher.update(b"gw_acct_v1:");
     hasher.update(key.as_bytes());
-    // First 16 hex chars is enough for unique identification
-    hex::encode(&hasher.finalize()[..8])
+    // 128-bit truncation: wide enough that an adversary cannot deliberately
+    // force account-id collisions to merge into / split out of clusters.
+    hex::encode(&hasher.finalize()[..16])
 }
 
 fn extract_from_json_body(body: &str) -> (Option<String>, Option<String>, Option<u32>) {
@@ -213,11 +230,29 @@ impl StreamReassembler {
 
         // Check if this is a fresh request (starts with HTTP method)
         if looks_like_http_request(&capture.text) {
+            // A single chunk larger than the cap is never reassembled.
+            if capture.text.len() > MAX_REQUEST_BYTES {
+                self.buffers.remove(&key);
+                return None;
+            }
+            // Refuse to start tracking new connections once the map is full,
+            // rather than growing it without bound under a partial-request flood.
+            if !self.buffers.contains_key(&key) && self.buffers.len() >= MAX_CONNS {
+                return None;
+            }
             // New request — replace any partial buffer
             self.buffers.insert(key, capture.text.clone());
         } else {
-            // Continuation — append to existing buffer
-            let buf = self.buffers.entry(key).or_default();
+            // Continuation — append only to an already-tracked request.
+            // A continuation with no in-flight request cannot be a valid
+            // request start, so we drop it instead of allocating a buffer
+            // (which would let stray chunks grow the connection map).
+            let buf = self.buffers.get_mut(&key)?;
+            if buf.len().saturating_add(capture.text.len()) > MAX_REQUEST_BYTES {
+                // Oversized / never-completing request — abandon it.
+                self.buffers.remove(&key);
+                return None;
+            }
             buf.push_str(&capture.text);
         }
 
@@ -248,7 +283,13 @@ fn is_complete_http_request(text: &str) -> bool {
 
     // If POST/PUT, check Content-Length vs actual body length
     if let Some(cl_str) = extract_header_value(text, "content-length") {
-        if let Ok(cl) = cl_str.parse::<usize>() {
+        if let Ok(cl) = cl_str.trim().parse::<usize>() {
+            // Don't wait forever for an implausibly large (or attacker-forged)
+            // body: treat the request as complete at the header boundary so
+            // the buffer is parsed and released instead of growing.
+            if cl > MAX_CONTENT_LENGTH {
+                return true;
+            }
             let body_start = text
                 .find("\r\n\r\n")
                 .map(|i| i + 4)

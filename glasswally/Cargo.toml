@@ -23,7 +23,6 @@ serde_json         = { workspace = true }
 dashmap            = { workspace = true }
 parking_lot        = { workspace = true }
 aho-corasick       = { workspace = true }
-md5                = { workspace = true }
 hex                = { workspace = true }
 sha2               = { workspace = true }
 petgraph           = { workspace = true }

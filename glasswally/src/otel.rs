@@ -35,7 +35,15 @@ use std::sync::Arc;
 use anyhow::Result;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
-use tracing::info;
+use tokio::sync::Semaphore;
+use tracing::{info, warn};
+
+/// Cap concurrent scrape connections so the endpoint can't be used for a
+/// connection-exhaustion DoS via unbounded task spawns.
+const MAX_METRICS_CONNS: usize = 32;
+
+/// Write deadline for a slow/stuck scraper.
+const METRICS_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 use crate::events::{DetectionSignal, RiskTier};
 
@@ -225,19 +233,29 @@ impl MetricsServer {
     ) -> Result<()> {
         let listener = TcpListener::bind(self.addr).await?;
         info!("OTel /metrics endpoint listening on {}", self.addr);
+        let conn_limit = Arc::new(Semaphore::new(MAX_METRICS_CONNS));
 
         loop {
-            let (mut stream, _) = listener.accept().await?;
+            let (mut stream, peer) = listener.accept().await?;
+            let Ok(permit) = Arc::clone(&conn_limit).try_acquire_owned() else {
+                warn!("/metrics connection limit reached — dropping {}", peer);
+                continue;
+            };
             let metrics = Arc::clone(&self.metrics);
             let store = Arc::clone(&store);
 
             tokio::spawn(async move {
+                let _permit = permit;
                 let body = metrics.prometheus_text(store.n_accounts(), store.n_clusters());
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(), body
                 );
-                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = tokio::time::timeout(
+                    METRICS_WRITE_TIMEOUT,
+                    stream.write_all(response.as_bytes()),
+                )
+                .await;
             });
         }
     }

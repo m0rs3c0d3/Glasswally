@@ -33,6 +33,14 @@ pub const W_5MIN: i64 = 5 * 60;
 pub const W_1HR: i64 = 60 * 60;
 pub const W_24HR: i64 = 24 * 60 * 60;
 
+/// Maximum number of related accounts processed in a single incremental
+/// cluster update. Without this, an attacker who makes many accounts share
+/// one cheap, self-controlled attribute (a /24 subnet, a JA3 hash) forces
+/// O(cluster size) work on *every* subsequent ingest — an
+/// algorithmic-complexity DoS — and can also rope unrelated accounts into a
+/// takedown cluster. Past this fan-out we stop re-expanding the cluster.
+pub const MAX_CLUSTER_FANOUT: usize = 512;
+
 // ── Per-account window ────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -107,7 +115,7 @@ impl AccountWindow {
             let joined = event.header_order.join("|");
             let mut h = Sha256::new();
             h.update(joined.as_bytes());
-            self.header_hashes.insert(hex::encode(&h.finalize()[..8]));
+            self.header_hashes.insert(hex::encode(&h.finalize()[..16]));
         }
         self.models_seen
             .push((event.timestamp, event.model.clone()));
@@ -366,6 +374,23 @@ impl StateStore {
 
         related.remove(account_id);
         if related.len() < 2 {
+            return;
+        }
+
+        // Cap fan-out: beyond this, the cluster is already established and
+        // re-expanding it every event is pure attacker-controllable cost.
+        if related.len() > MAX_CLUSTER_FANOUT {
+            if self.account_cluster.get(account_id).is_none() {
+                if let Some(any_rel) = related.iter().next() {
+                    if let Some(cid) = self.account_cluster.get(any_rel).map(|c| *c) {
+                        self.account_cluster.insert(account_id.to_string(), cid);
+                        self.clusters
+                            .entry(cid)
+                            .or_default()
+                            .insert(account_id.to_string());
+                    }
+                }
+            }
             return;
         }
 

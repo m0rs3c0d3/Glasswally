@@ -113,7 +113,11 @@ impl EvalResult {
         println!("|--------|---|---|----|-----|");
 
         let mut workers: Vec<_> = self.per_worker.iter().collect();
-        workers.sort_by(|a, b| b.1.f1().partial_cmp(&a.1.f1()).unwrap());
+        workers.sort_by(|a, b| {
+            b.1.f1()
+                .partial_cmp(&a.1.f1())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         for (worker, m) in workers {
             println!(
                 "| {:15} | {:.3} | {:.3} | {:.3} | {:.4} |",

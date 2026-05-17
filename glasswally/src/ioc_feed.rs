@@ -42,24 +42,38 @@ pub struct IocFeedEntry {
     pub exported_at: DateTime<Utc>,
 }
 
+/// Minimum acceptable length for an IOC feed signing/verification key.
+/// Short or empty keys are rejected outright — there is intentionally no
+/// "dev key" fallback, because this is open-source and any hardcoded key
+/// would let an attacker forge cross-provider IOC bundles.
+pub const MIN_IOC_KEY_LEN: usize = 32;
+
 impl IocFeedEntry {
-    pub fn new(bundle: IocBundle, provider_id: impl Into<String>, signing_key: &[u8]) -> Self {
+    pub fn new(
+        bundle: IocBundle,
+        provider_id: impl Into<String>,
+        signing_key: &[u8],
+    ) -> Result<Self> {
         let provider_id = provider_id.into();
         let canonical = serde_json::to_string(&bundle).unwrap_or_default();
-        let signature = hmac_sign(canonical.as_bytes(), signing_key);
-        Self {
+        let signature = hmac_sign(canonical.as_bytes(), signing_key)?;
+        Ok(Self {
             schema_version: "glasswally/ioc/v1".into(),
             provider_id,
             bundle,
             signature,
             exported_at: Utc::now(),
-        }
+        })
     }
 
     /// Verify the HMAC signature. Constant-time comparison.
+    /// Fails closed: an empty/short key or a signing error yields `false`.
     pub fn verify(&self, key: &[u8]) -> bool {
         let canonical = serde_json::to_string(&self.bundle).unwrap_or_default();
-        let expected = hmac_sign(canonical.as_bytes(), key);
+        let expected = match hmac_sign(canonical.as_bytes(), key) {
+            Ok(sig) => sig,
+            Err(_) => return false,
+        };
         // Constant-time XOR comparison
         let a = expected.as_bytes();
         let b = self.signature.as_bytes();
@@ -104,8 +118,12 @@ impl IocFeedGenerator {
         if bundle.confidence < 0.70 {
             return;
         }
-        let entry = IocFeedEntry::new(bundle, &self.provider_id, &self.signing_key);
-        self.entries.push(entry);
+        match IocFeedEntry::new(bundle, &self.provider_id, &self.signing_key) {
+            Ok(entry) => self.entries.push(entry),
+            Err(e) => {
+                tracing::error!("IOC bundle signing failed, dropping bundle: {e}");
+            }
+        }
     }
 
     /// Serialize all entries as an NDJSON string.
@@ -222,7 +240,7 @@ impl IocFeedPublisher {
             return Ok(());
         }
 
-        let entry = IocFeedEntry::new(bundle, &self.config.provider_id, &self.config.signing_key);
+        let entry = IocFeedEntry::new(bundle, &self.config.provider_id, &self.config.signing_key)?;
         let line = entry.to_jsonl();
 
         // Write to local file
@@ -296,14 +314,19 @@ impl FeedPoller {
 
 // ── HMAC helper ───────────────────────────────────────────────────────────────
 
-fn hmac_sign(data: &[u8], key: &[u8]) -> String {
-    // Fallback to a fixed key if the provided key is empty (dev-only)
-    let effective_key = if key.is_empty() {
-        b"glasswally_dev_key".as_ref()
-    } else {
-        key
-    };
-    let mut mac = HmacSha256::new_from_slice(effective_key).expect("HMAC key length error");
+fn hmac_sign(data: &[u8], key: &[u8]) -> Result<String> {
+    // No dev-key fallback by design: a hardcoded key in an open-source
+    // project would let anyone forge signed IOC bundles and poison the
+    // cross-provider trust channel. Reject weak/empty keys outright.
+    if key.len() < MIN_IOC_KEY_LEN {
+        anyhow::bail!(
+            "IOC feed key too short ({} bytes); require >= {} bytes of high-entropy key material",
+            key.len(),
+            MIN_IOC_KEY_LEN
+        );
+    }
+    let mut mac =
+        HmacSha256::new_from_slice(key).map_err(|e| anyhow::anyhow!("HMAC key error: {e}"))?;
     mac.update(data);
-    hex::encode(mac.finalize().into_bytes())
+    Ok(hex::encode(mac.finalize().into_bytes()))
 }

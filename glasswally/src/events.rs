@@ -149,7 +149,7 @@ impl H2Settings {
         );
         let mut h = Sha256::new();
         h.update(canonical.as_bytes());
-        self.fingerprint = hex::encode(&h.finalize()[..8]);
+        self.fingerprint = hex::encode(&h.finalize()[..16]);
     }
 }
 

@@ -23,12 +23,33 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
+use tokio::time::timeout;
 use tracing::{info, warn};
+
+/// Max concurrent client connections — bounds the per-connection task and
+/// socket fan-out so the API can't be connection-exhausted.
+const MAX_CONNS: usize = 256;
+
+/// Idle/read timeout for a client connection.
+const IO_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Constant-time byte-string equality (avoids token-comparison timing leaks).
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
 
 use crate::engine::fusion::FusionEngine;
 use crate::events::ActionKind;
@@ -46,6 +67,10 @@ pub struct AccountRequest {
     pub account_id: String,
     pub source_ip: Option<String>,
     pub user_agent: Option<String>,
+    /// Shared-secret bearer token. Required when the server is configured
+    /// with an `auth_token`; ignored otherwise.
+    #[serde(default)]
+    pub auth_token: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -84,6 +109,10 @@ pub struct QueryServer {
     store: Arc<StateStore>,
     engine: Arc<FusionEngine>,
     addr: SocketAddr,
+    /// Optional shared secret. When set, every request must present a
+    /// matching `auth_token` or it is rejected.
+    auth_token: Option<String>,
+    conn_limit: Arc<Semaphore>,
 }
 
 impl QueryServer {
@@ -92,17 +121,42 @@ impl QueryServer {
             store,
             engine,
             addr,
+            auth_token: None,
+            conn_limit: Arc::new(Semaphore::new(MAX_CONNS)),
         }
+    }
+
+    /// Configure a required shared-secret token for all requests.
+    pub fn with_auth_token(mut self, token: impl Into<String>) -> Self {
+        let token = token.into();
+        if !token.is_empty() {
+            self.auth_token = Some(token);
+        }
+        self
     }
 
     pub async fn serve(self: Arc<Self>) -> Result<()> {
         let listener = TcpListener::bind(self.addr).await?;
         info!("gRPC query API listening on {}", self.addr);
+        if self.auth_token.is_none() {
+            warn!(
+                "Query API on {} has NO auth token configured — bind it to \
+                 localhost / a trusted network only.",
+                self.addr
+            );
+        }
 
         loop {
             let (stream, peer) = listener.accept().await?;
+            // Reject (by dropping) connections beyond the concurrency cap
+            // instead of spawning unbounded tasks.
+            let Ok(permit) = Arc::clone(&self.conn_limit).try_acquire_owned() else {
+                warn!("Query API connection limit reached — dropping {}", peer);
+                continue;
+            };
             let srv = Arc::clone(&self);
             tokio::spawn(async move {
+                let _permit = permit;
                 if let Err(e) = srv.handle_connection(stream).await {
                     warn!("Query API connection error from {}: {}", peer, e);
                 }
@@ -112,12 +166,13 @@ impl QueryServer {
 
     async fn handle_connection(&self, mut stream: TcpStream) -> Result<()> {
         loop {
-            // Read 4-byte length prefix
+            // Read 4-byte length prefix (with an idle timeout)
             let mut len_buf = [0u8; 4];
-            match stream.read_exact(&mut len_buf).await {
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e.into()),
+            match timeout(IO_TIMEOUT, stream.read_exact(&mut len_buf)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => anyhow::bail!("client read timed out"),
             }
             let len = u32::from_le_bytes(len_buf) as usize;
             if len > 1_048_576 {
@@ -125,9 +180,20 @@ impl QueryServer {
             }
 
             let mut body = vec![0u8; len];
-            stream.read_exact(&mut body).await?;
+            timeout(IO_TIMEOUT, stream.read_exact(&mut body))
+                .await
+                .map_err(|_| anyhow::anyhow!("client body read timed out"))??;
 
             let req: AccountRequest = serde_json::from_slice(&body)?;
+
+            // Enforce shared-secret auth (constant-time) when configured.
+            if let Some(expected) = &self.auth_token {
+                let presented = req.auth_token.as_deref().unwrap_or("");
+                if !ct_eq(presented.as_bytes(), expected.as_bytes()) {
+                    anyhow::bail!("unauthorized: missing or invalid auth token");
+                }
+            }
+
             let resp = self.check_account(&req.account_id);
             let resp_bytes = serde_json::to_vec(&resp)?;
 

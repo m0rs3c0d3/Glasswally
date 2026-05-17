@@ -26,6 +26,17 @@ impl Dispatcher {
     pub fn new(output_dir: impl Into<PathBuf>) -> Self {
         let out: PathBuf = output_dir.into();
         std::fs::create_dir_all(&out).expect("Failed to create output directory");
+        // Enforcement / IOC / audit logs contain account IDs, evidence and
+        // IP IOCs. Restrict the directory to the owner so other local users
+        // can't read them or plant symlinks for the append-only writers to
+        // follow (CWE-377 / CWE-59).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o700)) {
+                tracing::warn!("Could not tighten output dir permissions: {e}");
+            }
+        }
         Self { out }
     }
 

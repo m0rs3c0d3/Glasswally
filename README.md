@@ -97,4 +97,4 @@ MIT — use it, fork it, deploy it. If you find something interesting, open an i
 
 ---
 
-*Part of the [m0rs3c0d3](https://github.com/m0rs3c0d3) security tooling portfolio.*
+*Part of the [noisyloop](https://github.com/noisyloop) security tooling portfolio.*

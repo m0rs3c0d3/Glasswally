@@ -49,6 +49,17 @@ jobs:
       - name: cargo fmt
         run: cargo fmt -p glasswally -- --check
 
+  audit:
+    name: cargo-audit (RUSTSEC advisory scan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Run advisory scan
+        run: cargo audit --deny warnings
+
   yara:
     name: YARA rule syntax check
     runs-on: ubuntu-latest

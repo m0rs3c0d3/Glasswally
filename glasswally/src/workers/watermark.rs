@@ -69,18 +69,30 @@ pub fn detect(text: &str, accounts: &[String]) -> Option<(String, f32)> {
         .map(|c| c == ZWJ)
         .collect();
 
-    if extracted.len() < 8 {
+    // Require a meaningful sample: with too few bits the 0.85 threshold is
+    // hit by chance, producing false attributions when scanning many
+    // accounts. 32 bits = one full key period.
+    if extracted.len() < 32 {
         return None;
     }
 
+    let check_len = extracted.len().min(128);
     for account_id in accounts {
         let expected = account_watermark_bits(account_id);
-        let check_len = extracted.len().min(64);
-        let matches = (0..check_len)
-            .filter(|&i| extracted[i] == expected[i % 32])
-            .count();
-        let confidence = matches as f32 / check_len as f32;
-        if confidence >= 0.85 {
+        // Try every phase offset: a single inserted/removed space (or a
+        // leading stripped marker) shifts the bitstream, which would
+        // otherwise defeat detection entirely.
+        let mut best = 0usize;
+        for phase in 0..32 {
+            let matches = (0..check_len)
+                .filter(|&i| extracted[i] == expected[(i + phase) % 32])
+                .count();
+            best = best.max(matches);
+        }
+        let confidence = best as f32 / check_len as f32;
+        // Require both a high ratio AND a minimum absolute match count so a
+        // short noisy sample can't cross the threshold by luck.
+        if confidence >= 0.85 && best >= 28 {
             return Some((account_id.clone(), confidence));
         }
     }

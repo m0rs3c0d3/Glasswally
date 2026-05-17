@@ -367,5 +367,8 @@ fn parse_ssl_event(buf: &BytesMut) -> Option<RawSslEvent> {
     if buf.len() < std::mem::size_of::<RawSslEvent>() {
         return None;
     }
-    Some(unsafe { &*(buf.as_ptr() as *const RawSslEvent) }.clone())
+    // The perf-ring backing buffer is not guaranteed to be aligned for
+    // `RawSslEvent`, so a plain `&*(ptr as *const RawSslEvent)` reference
+    // would be undefined behavior. Read the bytes unaligned instead.
+    Some(unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const RawSslEvent) })
 }

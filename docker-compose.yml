@@ -60,11 +60,13 @@ services:
       glasswally
         --mode tail
         --path /logs/access.jsonl
-        --output-dir /output
-        --metrics-addr 0.0.0.0:9090
+        --output /output
+    # Ports are only published on the loopback interface — the query API
+    # is unauthenticated by default and the metrics endpoint leaks
+    # operational detail, so neither should be reachable off-host.
     ports:
-      - "9090:9090"   # Prometheus /metrics
-      - "50051:50051" # gRPC query API
+      - "127.0.0.1:9090:9090"   # Prometheus /metrics (internal only)
+      - "127.0.0.1:50051:50051" # query API (internal only)
     depends_on:
       - redis
       - kafka
@@ -73,7 +75,7 @@ services:
     networks:
       - gw
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:9090/metrics"]
+      test: ["CMD-SHELL", "pgrep -f glasswally >/dev/null"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -85,7 +87,7 @@ services:
       - redis_data:/data
     command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     networks:
       - gw
     healthcheck:
@@ -111,7 +113,7 @@ services:
     volumes:
       - kafka_data:/var/lib/kafka/data
     ports:
-      - "9092:9092"
+      - "127.0.0.1:9092:9092"
     networks:
       - gw
     healthcheck:
@@ -130,7 +132,7 @@ services:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.retention.time=7d"
     ports:
-      - "9091:9090"
+      - "127.0.0.1:9091:9090"
     depends_on:
       - glasswally
     networks:
@@ -144,12 +146,12 @@ services:
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
     environment:
-      GF_SECURITY_ADMIN_PASSWORD: admin
+      # Override via the host environment; do NOT ship a known default.
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in your environment}
       GF_USERS_ALLOW_SIGN_UP: "false"
-      GF_AUTH_ANONYMOUS_ENABLED: "true"
-      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     depends_on:
       - prometheus
     networks:
@@ -163,8 +165,23 @@ services:
       dockerfile: Dockerfile
     profiles:
       - ebpf
-    privileged: true
+    # Drop full `privileged: true` (which would grant all caps + device
+    # access, turning any daemon compromise into host root). Grant only the
+    # capabilities eBPF actually needs. `pid: host` is required so uprobes
+    # can find target TLS libraries/Go binaries via /proc.
+    privileged: false
     pid: "host"
+    cap_drop:
+      - ALL
+    cap_add:
+      - BPF
+      - PERFMON
+      - SYS_ADMIN      # required for uprobe attach on kernels < 5.8 paths
+      - SYS_RESOURCE   # raise RLIMIT_MEMLOCK for BPF maps
+    security_opt:
+      - no-new-privileges:true
+    ulimits:
+      memlock: -1
     volumes:
       - /sys/kernel/debug:/sys/kernel/debug:ro
       - ./output:/output
@@ -173,11 +190,10 @@ services:
     command: >
       glasswally
         --mode ebpf
-        --output-dir /output
-        --metrics-addr 0.0.0.0:9090
+        --output /output
     ports:
-      - "9090:9090"
-      - "50051:50051"
+      - "127.0.0.1:9090:9090"
+      - "127.0.0.1:50051:50051"
     depends_on:
       - redis
       - kafka

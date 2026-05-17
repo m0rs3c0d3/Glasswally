@@ -44,6 +44,10 @@ mod redteam;
 mod state;
 mod workers;
 
+/// Drop pathologically long JSONL lines instead of parsing them — bounds
+/// memory/CPU if the feed file is attacker-influenced.
+const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
+
 use engine::{dispatcher::Dispatcher, fusion::FusionEngine};
 use events::{ActionKind, ApiEvent, RiskTier};
 use state::window::StateStore;
@@ -62,7 +66,7 @@ struct Cli {
 
     #[arg(
         long,
-        default_value = "/tmp/glasswally_feed.jsonl",
+        default_value = "./glasswally_feed.jsonl",
         help = "JSONL log path (tail/replay modes)"
     )]
     path: PathBuf,
@@ -72,7 +76,7 @@ struct Cli {
 
     #[arg(
         long,
-        default_value = "/tmp/glasswally_output",
+        default_value = "./glasswally_output",
         help = "Enforcement output directory"
     )]
     output: PathBuf,
@@ -212,6 +216,10 @@ async fn tail_jsonl(path: PathBuf, tx: mpsc::Sender<ApiEvent>, seek_end: bool) -
     loop {
         match lines.next_line().await? {
             Some(line) => {
+                if line.len() > MAX_LINE_BYTES {
+                    warn!("Dropping oversized feed line ({} bytes)", line.len());
+                    continue;
+                }
                 let line = line.trim().to_string();
                 if line.is_empty() {
                     continue;
@@ -259,31 +267,40 @@ async fn main() -> Result<()> {
     let tx2 = tx.clone();
     match cli.mode {
         Mode::Ebpf => {
-            println!("  Mode: \x1b[91;1meBPF\x1b[0m  |  Attaching kernel uprobes...");
-            println!("  \x1b[90mRequires: Linux 5.8+, CAP_BPF or root\x1b[0m\n");
+            // Hard-fail rather than silently degrade: an operator running
+            // `--mode ebpf` must not be left believing kernel monitoring is
+            // active when it is not. Silently tailing a file would be a
+            // detection-control failure (false sense of security).
+            #[cfg(not(feature = "live-ebpf"))]
+            {
+                let _ = tx2;
+                eprintln!(
+                    "error: eBPF mode requires the `live-ebpf` build feature and Linux 5.8+."
+                );
+                eprintln!(
+                    "Build with: cargo xtask build-ebpf && \
+                     cargo run --features live-ebpf -- --mode ebpf"
+                );
+                eprintln!(
+                    "Refusing to fall back to tail mode — that would silently \
+                     disable kernel monitoring."
+                );
+                std::process::exit(2);
+            }
 
-            // In full production build (--features live-ebpf):
-            //   let loader  = loader::GlasswallLoader::load()?;
-            //   let mut rx_ssl = loader.attach_and_stream().await?;
-            //   // Reconstruct HTTP from SSL plaintext + convert to ApiEvent
-            //   tokio::spawn(async move {
-            //       let mut reassembler = http_reconstruct::StreamReassembler::new();
-            //       while let Some(capture) = rx_ssl.recv().await {
-            //           if let Some(req) = reassembler.feed(capture) {
-            //               if let Some(ev) = api_event_from_request(req) {
-            //                   tx2.send(ev).await.ok();
-            //               }
-            //           }
-            //       }
-            //   });
-
-            eprintln!("eBPF mode requires --features live-ebpf and Linux 5.8+.");
-            eprintln!("Build with: cargo xtask build-ebpf && cargo run --features live-ebpf -- --mode ebpf");
-            eprintln!("\nFalling back to tail mode for this run.");
-            let path = cli.path.clone();
-            tokio::spawn(async move {
-                tail_jsonl(path, tx2, false).await.ok();
-            });
+            #[cfg(feature = "live-ebpf")]
+            {
+                println!("  Mode: \x1b[91;1meBPF\x1b[0m  |  Attaching kernel uprobes...");
+                println!("  \x1b[90mRequires: Linux 5.8+, CAP_BPF or root\x1b[0m\n");
+                let loader = loader::GlasswallLoader::load()?;
+                let (mut rx_ssl, _report) = loader.attach_and_stream().await?;
+                tokio::spawn(async move {
+                    let mut reassembler = http_reconstruct::StreamReassembler::new();
+                    while let Some(capture) = rx_ssl.recv().await {
+                        let _ = reassembler.feed(capture);
+                    }
+                });
+            }
         }
 
         Mode::Tail => {
@@ -328,6 +345,9 @@ async fn replay_jsonl(path: PathBuf, tx: mpsc::Sender<ApiEvent>, speed: f64) -> 
     let mut events: Vec<(f64, ApiEvent)> = Vec::new();
 
     for line in content.lines() {
+        if line.len() > MAX_LINE_BYTES {
+            continue;
+        }
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -341,7 +361,7 @@ async fn replay_jsonl(path: PathBuf, tx: mpsc::Sender<ApiEvent>, speed: f64) -> 
     if events.is_empty() {
         return Ok(());
     }
-    events.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    events.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
     let base_ts = events[0].0;
     let base_wall = std::time::Instant::now();

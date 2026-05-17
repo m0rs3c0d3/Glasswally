@@ -1,6 +1,6 @@
 # Glasswally
 
-[![CI](https://github.com/m0rs3c0d3/Glasswally/actions/workflows/ci.yml/badge.svg)](https://github.com/m0rs3c0d3/Glasswally/actions/workflows/ci.yml)
+[![CI](https://github.com/noisyloop/Glasswally/actions/workflows/ci.yml/badge.svg)](https://github.com/noisyloop/Glasswally/actions/workflows/ci.yml)
 
 **Real-time LLM distillation attack detection via eBPF**
 

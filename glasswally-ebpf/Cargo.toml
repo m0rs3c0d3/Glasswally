@@ -1,10 +1,13 @@
+# This crate is `exclude`d from the root workspace (it builds for a BPF
+# target), so it cannot use `workspace = true` key inheritance — values are
+# spelled out literally here.
 [package]
 name        = "glasswally-ebpf"
-version.workspace  = true
-edition.workspace  = true
-license.workspace  = true
-authors.workspace  = true
-repository.workspace = true
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT"
+authors     = ["noisyloop"]
+repository  = "https://github.com/noisyloop/Glasswally"
 description = "Glasswally eBPF kernel programs — ssl uprobes + tcp kprobe"
 
 [[bin]]
@@ -12,7 +15,9 @@ name = "glasswally-ebpf"
 path = "src/main.rs"
 
 [dependencies]
-aya-bpf      = "0.1"
+# aya-bpf was never published to crates.io; aya-ebpf is its renamed successor
+# and pairs with the aya 0.13 userspace loader.
+aya-ebpf     = "0.1"
 aya-log-ebpf = "0.1"
 
 [profile.dev]

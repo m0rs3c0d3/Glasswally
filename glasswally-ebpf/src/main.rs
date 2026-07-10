@@ -22,14 +22,13 @@
 #![no_std]
 #![no_main]
 
-use aya_bpf::{
+use aya_ebpf::{
     macros::{kprobe, map, uprobe, uretprobe},
-    maps::{HashMap, PerfEventArray},
+    maps::{HashMap, PerCpuArray, PerfEventArray},
     programs::{ProbeContext, RetProbeContext},
-    BpfContext,
     helpers::{bpf_get_current_pid_tgid, bpf_probe_read_user_buf},
 };
-use aya_log_ebpf::info;
+
 
 // ── Shared event types ────────────────────────────────────────────────────────
 
@@ -78,11 +77,18 @@ static CONN_EVENTS: PerfEventArray<ConnEvent> = PerfEventArray::new(0);
 static DOH_EVENTS:  PerfEventArray<DohEvent>  = PerfEventArray::new(0);
 
 /// Scratch: pid_tgid → (buf_ptr, len) for ssl_write entry → exit correlation.
+/// The user buffer address is stored as u64 — a raw pointer would make the
+/// map value !Sync, which static BPF maps require.
 #[repr(C)]
-struct SslWriteArgs { buf: *const u8, len: i32 }
+struct SslWriteArgs { buf: u64, len: i32 }
 
 #[repr(C)]
-struct SslReadArgs  { buf: *const u8 }
+struct SslReadArgs  { buf: u64 }
+
+/// Per-CPU scratch for building SslEvent — at 4KB+ it exceeds the 512-byte
+/// BPF stack limit, so it must live in map memory instead.
+#[map]
+static SSL_EVENT_SCRATCH: PerCpuArray<SslEvent> = PerCpuArray::with_max_entries(1, 0);
 
 #[map]
 static SSL_WRITE_ARGS: HashMap<u64, SslWriteArgs> = HashMap::with_max_entries(2048, 0);
@@ -96,7 +102,7 @@ static SSL_READ_ARGS:  HashMap<u64, SslReadArgs>  = HashMap::with_max_entries(20
 //              libnss3.so PR_Write   (NSS)
 //              Go binary at crypto/tls.(*Conn).Write offset
 
-#[uprobe(name = "ssl_write_enter")]
+#[uprobe]
 pub fn ssl_write_enter(ctx: ProbeContext) -> u32 {
     match try_ssl_write_enter(&ctx) { Ok(()) => 0, Err(_) => 1 }
 }
@@ -105,11 +111,11 @@ fn try_ssl_write_enter(ctx: &ProbeContext) -> Result<(), i64> {
     let buf: *const u8 = ctx.arg(1).ok_or(1i64)?;
     let len: i32        = ctx.arg(2).ok_or(1i64)?;
     let pid_tgid = bpf_get_current_pid_tgid();
-    unsafe { SSL_WRITE_ARGS.insert(&pid_tgid, &SslWriteArgs { buf, len }, 0).map_err(|e| e as i64)? }
+    SSL_WRITE_ARGS.insert(&pid_tgid, &SslWriteArgs { buf: buf as u64, len }, 0).map_err(|e| e as i64)?;
     Ok(())
 }
 
-#[uretprobe(name = "ssl_write_exit")]
+#[uretprobe]
 pub fn ssl_write_exit(ctx: RetProbeContext) -> u32 {
     match try_ssl_write_exit(&ctx) { Ok(()) => 0, Err(_) => 1 }
 }
@@ -121,20 +127,22 @@ fn try_ssl_write_exit(ctx: &RetProbeContext) -> Result<(), i64> {
     if retval <= 0 { return Ok(()); }
 
     let cap_len = (retval as usize).min(MAX_BUF) as u32;
-    let mut event = SslEvent {
-        pid: (pid_tgid >> 32) as u32, tid: (pid_tgid & 0xFFFFFFFF) as u32,
-        fd: 0, direction: 0, buf_len: cap_len, buf: [0u8; MAX_BUF],
-    };
-    unsafe { bpf_probe_read_user_buf(args.buf, &mut event.buf[..cap_len as usize]).map_err(|e| e as i64)?; }
-    SSL_EVENTS.output(ctx, &event, 0);
-    unsafe { SSL_WRITE_ARGS.remove(&pid_tgid).ok(); }
+    let event = unsafe { &mut *SSL_EVENT_SCRATCH.get_ptr_mut(0).ok_or(1i64)? };
+    event.pid = (pid_tgid >> 32) as u32;
+    event.tid = (pid_tgid & 0xFFFFFFFF) as u32;
+    event.fd = 0;
+    event.direction = 0;
+    event.buf_len = cap_len;
+    unsafe { bpf_probe_read_user_buf(args.buf as *const u8, &mut event.buf[..cap_len as usize]).map_err(|e| e as i64)?; }
+    SSL_EVENTS.output(ctx, event, 0);
+    SSL_WRITE_ARGS.remove(&pid_tgid).ok();
     Ok(())
 }
 
 // ── SSL_READ uprobe ───────────────────────────────────────────────────────────
 // Captures API responses — important for response quality / watermark detection.
 
-#[uprobe(name = "ssl_read_enter")]
+#[uprobe]
 pub fn ssl_read_enter(ctx: ProbeContext) -> u32 {
     match try_ssl_read_enter(&ctx) { Ok(()) => 0, Err(_) => 1 }
 }
@@ -142,11 +150,11 @@ pub fn ssl_read_enter(ctx: ProbeContext) -> u32 {
 fn try_ssl_read_enter(ctx: &ProbeContext) -> Result<(), i64> {
     let buf: *const u8 = ctx.arg(1).ok_or(1i64)?;
     let pid_tgid = bpf_get_current_pid_tgid();
-    unsafe { SSL_READ_ARGS.insert(&pid_tgid, &SslReadArgs { buf }, 0).map_err(|e| e as i64)? }
+    SSL_READ_ARGS.insert(&pid_tgid, &SslReadArgs { buf: buf as u64 }, 0).map_err(|e| e as i64)?;
     Ok(())
 }
 
-#[uretprobe(name = "ssl_read_exit")]
+#[uretprobe]
 pub fn ssl_read_exit(ctx: RetProbeContext) -> u32 {
     match try_ssl_read_exit(&ctx) { Ok(()) => 0, Err(_) => 1 }
 }
@@ -158,20 +166,22 @@ fn try_ssl_read_exit(ctx: &RetProbeContext) -> Result<(), i64> {
     if retval <= 0 { return Ok(()); }
 
     let cap_len = (retval as usize).min(MAX_BUF) as u32;
-    let mut event = SslEvent {
-        pid: (pid_tgid >> 32) as u32, tid: (pid_tgid & 0xFFFFFFFF) as u32,
-        fd: 0, direction: 1, buf_len: cap_len, buf: [0u8; MAX_BUF],
-    };
-    unsafe { bpf_probe_read_user_buf(args.buf, &mut event.buf[..cap_len as usize]).map_err(|e| e as i64)?; }
-    SSL_EVENTS.output(ctx, &event, 0);
-    unsafe { SSL_READ_ARGS.remove(&pid_tgid).ok(); }
+    let event = unsafe { &mut *SSL_EVENT_SCRATCH.get_ptr_mut(0).ok_or(1i64)? };
+    event.pid = (pid_tgid >> 32) as u32;
+    event.tid = (pid_tgid & 0xFFFFFFFF) as u32;
+    event.fd = 0;
+    event.direction = 1;
+    event.buf_len = cap_len;
+    unsafe { bpf_probe_read_user_buf(args.buf as *const u8, &mut event.buf[..cap_len as usize]).map_err(|e| e as i64)?; }
+    SSL_EVENTS.output(ctx, event, 0);
+    SSL_READ_ARGS.remove(&pid_tgid).ok();
     Ok(())
 }
 
 // ── TCP connect kprobe ────────────────────────────────────────────────────────
 // Tracks new TCP connections — gives us 5-tuple metadata for SSL correlation.
 
-#[kprobe(name = "tcp_connect_entry")]
+#[kprobe]
 pub fn tcp_connect_entry(ctx: ProbeContext) -> u32 {
     match try_tcp_connect(&ctx) { Ok(()) => 0, Err(_) => 1 }
 }
@@ -196,7 +206,7 @@ fn try_tcp_connect(ctx: &ProbeContext) -> Result<(), i64> {
 // In production: parse the UDP payload to confirm DNS query format.
 // Here we emit an event for port 853; userspace correlates via pid→account map.
 
-#[kprobe(name = "udp_sendmsg_entry")]
+#[kprobe]
 pub fn udp_sendmsg_entry(ctx: ProbeContext) -> u32 {
     match try_udp_sendmsg(&ctx) { Ok(()) => 0, Err(_) => 1 }
 }

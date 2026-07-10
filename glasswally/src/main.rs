@@ -11,11 +11,13 @@
 //   ebpf    — live kernel uprobes on ssl_write/ssl_read (Linux 5.8+, production)
 //   tail    — tail a JSONL API gateway log file (any platform, staging)
 //   replay  — replay a captured log at scaled speed (testing/research)
+//   eval    — run the labeled-dataset evaluation harness and exit
 //
 // Usage:
 //   sudo glasswally --mode ebpf                            # live eBPF
 //   glasswally --mode tail --path /var/log/api/access.jsonl
 //   glasswally --mode replay --path captured.jsonl --speed 10.0
+//   glasswally --mode eval --path datasets/labeled_5k.jsonl
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -83,6 +85,13 @@ struct Cli {
 
     #[arg(long, default_value = "443", help = "TLS port for eBPF mode")]
     port: u16,
+
+    #[arg(
+        long,
+        default_value = "0.35",
+        help = "Composite score alert threshold (eval mode)"
+    )]
+    eval_threshold: f32,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -90,6 +99,7 @@ enum Mode {
     Ebpf,   // live kernel uprobes (Linux 5.8+, requires CAP_BPF or root)
     Tail,   // tail a live JSONL log file
     Replay, // replay a static JSONL file at scaled speed
+    Eval,   // run the labeled-dataset evaluation harness and exit
 }
 
 // ── Pipeline ──────────────────────────────────────────────────────────────────
@@ -150,7 +160,7 @@ fn print_banner() {
     println!("  ╚═════╝ ╚══════╝╚═╝  ╚═╝╚══════╝╚══════╝ ╚══╝╚══╝ ╚═╝  ╚═╝╚══════╝╚══════╝╚═╝   ");
     println!("\x1b[0m");
     println!("  \x1b[90mReal-time LLM distillation attack detection | eBPF + Rust\x1b[0m");
-    println!("  \x1b[90mgithub.com/m0rs3c0d3/glasswally\x1b[0m\n");
+    println!("  \x1b[90mgithub.com/noisyloop/Glasswally\x1b[0m\n");
 }
 
 fn print_alert(decision: &events::RiskDecision, action: &ActionKind) {
@@ -249,6 +259,16 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    // Eval mode: run the labeled-dataset harness, print the report, exit.
+    if matches!(cli.mode, Mode::Eval) {
+        let result = eval::Evaluator::new(cli.eval_threshold)
+            .run_dataset(&cli.path)
+            .await?;
+        result.print_report();
+        return Ok(());
+    }
+
     let pipeline = Arc::new(Pipeline::new(cli.output.clone()));
     let start = Instant::now();
     let (tx, mut rx) = mpsc::channel::<ApiEvent>(16384);
@@ -297,7 +317,15 @@ async fn main() -> Result<()> {
                 tokio::spawn(async move {
                     let mut reassembler = http_reconstruct::StreamReassembler::new();
                     while let Some(capture) = rx_ssl.recv().await {
-                        let _ = reassembler.feed(capture);
+                        // Reconstructed requests feed the same channel as
+                        // tail/replay — one pipeline, no second code path.
+                        if let Some(req) = reassembler.feed(capture) {
+                            if let Some(ev) = ApiEvent::from_http_request(&req) {
+                                if tx2.send(ev).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
                     }
                 });
             }
@@ -311,6 +339,8 @@ async fn main() -> Result<()> {
                 tail_jsonl(path, tx2, true).await.ok();
             });
         }
+
+        Mode::Eval => unreachable!("handled before pipeline setup"),
 
         Mode::Replay => {
             println!(
@@ -329,6 +359,12 @@ async fn main() -> Result<()> {
 
     println!("  Press Ctrl+C to stop.\n");
 
+    // Drop the local sender: once every source task has finished (replay
+    // reaching EOF), the channel closes and the consumer loop below exits.
+    // Long-running sources (tail, ebpf) hold their own clone, so they keep
+    // the process alive.
+    drop(tx);
+
     // Main consumer — spawn one task per event for parallelism
     while let Some(event) = rx.recv().await {
         let p = Arc::clone(&pipeline);
@@ -336,6 +372,21 @@ async fn main() -> Result<()> {
             p.process(event).await;
         });
     }
+
+    // Let in-flight per-event tasks finish printing before exit.
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    let events = pipeline
+        .store
+        .total_events
+        .load(std::sync::atomic::Ordering::Relaxed);
+    println!(
+        "\n\x1b[1mReplay complete — {} events, {} accounts, {} clusters. \
+         Enforcement output in {}\x1b[0m",
+        events,
+        pipeline.store.n_accounts(),
+        pipeline.store.n_clusters(),
+        cli.output.display()
+    );
 
     Ok(())
 }

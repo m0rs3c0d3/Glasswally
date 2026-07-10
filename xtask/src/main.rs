@@ -8,6 +8,7 @@
 //   cargo xtask run --release       # release build
 //   cargo xtask vmlinux             # generate vmlinux.h from running kernel
 //   cargo xtask evaluate [PATH]     # run eval harness against labeled JSONL dataset
+//   cargo xtask demo                # replay the bundled sample dataset (no root needed)
 //
 // How it works:
 //   BPF programs must be compiled to a special target (bpfel-unknown-none)
@@ -32,6 +33,7 @@ fn main() {
         "vmlinux"     => generate_vmlinux(),
         "check"       => check(),
         "evaluate"    => evaluate(path_arg),
+        "demo"        => demo(),
         "help" | _    => print_help(),
     }
 }
@@ -59,22 +61,26 @@ fn build_ebpf(release: bool) {
     let root   = workspace_root();
     let target = "bpfel-unknown-none";
 
-    // Ensure the BPF target is installed
+    // bpfel-unknown-none is a tier-3 target with no rustup-distributed
+    // components — core is built from source, which needs rust-src.
     let status = Command::new("rustup")
-        .args(&["target", "add", target, "--toolchain", "nightly"])
+        .args(&["component", "add", "rust-src", "--toolchain", "nightly"])
         .status()
         .expect("Failed to run rustup");
     if !status.success() {
-        eprintln!("Warning: Could not add BPF target. Run: rustup target add {} --toolchain nightly", target);
+        eprintln!("Warning: could not add rust-src. Run: rustup component add rust-src --toolchain nightly");
     }
 
-    // Build the BPF crate targeting BPF VM
+    // Build the BPF crate targeting the BPF VM. The crate is excluded from
+    // the workspace (`-p` won't resolve it), so build from its own directory,
+    // but keep the artifacts in the workspace target/ dir where the
+    // glasswally build.rs expects to find the object.
     let mut cmd = Command::new("cargo");
-    cmd.current_dir(&root)
+    cmd.current_dir(root.join("glasswally-ebpf"))
+        .env("CARGO_TARGET_DIR", root.join("target"))
         .args(&[
             "+nightly",
             "build",
-            "--package", "glasswally-ebpf",
             "--target", target,
             "-Z", "build-std=core",  // BPF needs no_std core
         ]);
@@ -83,8 +89,9 @@ fn build_ebpf(release: bool) {
         cmd.arg("--release");
     }
 
-    // Tell the compiler this is a BPF build
-    cmd.env("CARGO_ENCODED_RUSTFLAGS", "-C panic=abort");
+    // CARGO_ENCODED_RUSTFLAGS is 0x1f-separated; a space-joined string would
+    // reach rustc as one garbled flag ("unknown codegen option ` panic`").
+    cmd.env("CARGO_ENCODED_RUSTFLAGS", "-C\x1fpanic=abort");
 
     let status = cmd.status().expect("Failed to build eBPF programs");
     if !status.success() {
@@ -202,6 +209,26 @@ fn evaluate(path: Option<String>) {
     }
 }
 
+/// Replay the bundled sample dataset through the full detection pipeline and
+/// print alerts. Needs no root, no eBPF, no kernel requirements.
+fn demo() {
+    let root = workspace_root();
+    let status = Command::new("cargo")
+        .current_dir(&root)
+        .args(&[
+            "run", "--release", "--package", "glasswally", "--",
+            "--mode", "replay",
+            "--path", "examples/sample_events.jsonl",
+            "--speed", "60",
+            "--output", "./glasswally_output",
+        ])
+        .status()
+        .expect("Failed to run glasswally demo");
+    if !status.success() {
+        std::process::exit(1);
+    }
+}
+
 fn print_help() {
     println!("Glasswally build tooling\n");
     println!("USAGE:");
@@ -211,7 +238,8 @@ fn print_help() {
     println!("  run          Build BPF + run userspace pipeline");
     println!("  vmlinux      Generate vmlinux.h from running kernel BTF");
     println!("  check        Run cargo check on all crates");
-  println!("  evaluate     Run eval harness (default: datasets/labeled_5k.jsonl)");
+    println!("  evaluate     Run eval harness (default: datasets/labeled_5k.jsonl)");
+    println!("  demo         Replay examples/sample_events.jsonl through the pipeline");
     println!("\nPREREQUISITES:");
     println!("  rustup toolchain install nightly");
     println!("  rustup target add bpfel-unknown-none --toolchain nightly");

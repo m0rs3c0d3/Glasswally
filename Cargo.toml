@@ -9,8 +9,8 @@ resolver = "2"
 version     = "0.1.0"
 edition     = "2021"
 license     = "MIT"
-authors     = ["m0rs3c0d3"]
-repository  = "https://github.com/m0rs3c0d3/glasswally"
+authors     = ["noisyloop"]
+repository  = "https://github.com/noisyloop/Glasswally"
 description = "Real-time LLM distillation attack detection via eBPF"
 
 # Shared dependencies — referenced as workspace.dependencies in members

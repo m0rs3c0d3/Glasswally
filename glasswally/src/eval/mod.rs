@@ -164,6 +164,19 @@ impl Evaluator {
         }
 
         info!("Loaded {} events from {}", events.len(), path.display());
+
+        // Rebase timestamps so the dataset ends "now", preserving all
+        // inter-event deltas. The sliding windows (events_in) are anchored to
+        // wall clock, so a committed dataset with historical timestamps would
+        // otherwise fall outside every window and no worker would fire.
+        if let Some(max_ts) = events.iter().map(|e| e.timestamp).max() {
+            let shift = chrono::Utc::now() - max_ts;
+            for ev in &mut events {
+                ev.timestamp += shift;
+            }
+            events.sort_by_key(|e| e.timestamp);
+        }
+
         self.evaluate(events).await
     }
 

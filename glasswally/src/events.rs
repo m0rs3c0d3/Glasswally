@@ -241,6 +241,47 @@ pub struct ApiEvent {
     pub campaign_label: Option<String>,
 }
 
+impl ApiEvent {
+    /// Map a reconstructed HTTP request (eBPF capture path) onto the shared
+    /// pipeline event type. Fields the kernel capture cannot know yet
+    /// (JA3, ASN, geo, payment) are left unset; workers that need them
+    /// simply see no signal. Returns None when no account could be derived.
+    pub fn from_http_request(req: &HttpRequest) -> Option<ApiEvent> {
+        let account_id = req.account_id.clone()?;
+        Some(ApiEvent {
+            request_id: format!(
+                "{}-{}",
+                account_id,
+                req.timestamp.timestamp_nanos_opt().unwrap_or(0)
+            ),
+            account_id,
+            timestamp: req.timestamp,
+            ip_address: req
+                .conn_key
+                .as_ref()
+                .map(|k| k.src_ip)
+                .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+            user_agent: req.header("user-agent").unwrap_or("").to_string(),
+            model: req.model.clone().unwrap_or_default(),
+            prompt: req.prompt.clone().unwrap_or_default(),
+            token_count: req.token_count.unwrap_or(0),
+            payment_method_hash: None,
+            org_id: None,
+            country_code: String::new(),
+            header_order: req.header_names_in_order(),
+            ja3_hash: None,
+            ja3s_hash: None,
+            h2_settings: None,
+            tls_library: None,
+            asn_number: None,
+            asn_org: None,
+            max_tokens: None,
+            system_prompt_hash: None,
+            campaign_label: None,
+        })
+    }
+}
+
 // ── Detection types ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]

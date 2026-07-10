@@ -3,7 +3,7 @@
 ## Quick start
 
 ```bash
-git clone https://github.com/m0rs3c0d3/glasswally
+git clone https://github.com/noisyloop/Glasswally
 cd glasswally
 
 # Install Rust stable

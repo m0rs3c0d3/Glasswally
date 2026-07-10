@@ -86,7 +86,7 @@ sudo glasswally \
 ### 2. Docker Compose (full stack)
 
 ```bash
-git clone https://github.com/m0rs3c0d3/glasswally
+git clone https://github.com/noisyloop/Glasswally
 cd glasswally
 docker compose up --build -d
 
@@ -114,7 +114,7 @@ spec:
       hostPID: true
       containers:
         - name: glasswally
-          image: ghcr.io/m0rs3c0d3/glasswally:latest
+          image: ghcr.io/noisyloop/glasswally:latest
           securityContext:
             privileged: true
           volumeMounts:

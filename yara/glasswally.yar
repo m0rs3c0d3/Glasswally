@@ -15,7 +15,7 @@
  * field to compute a composite risk score matching Glasswally's fusion engine.
  *
  * Version: 0.1.0
- * Maintainer: m0rs3c0d3
+ * Maintainer: noisyloop
  */
 
 // ── CoT Elicitation patterns ─────────────────────────────────────────────────

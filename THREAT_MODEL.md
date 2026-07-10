@@ -3,7 +3,7 @@
 
 **Version**: 0.1.0
 **Last Updated**: 2026-02-27
-**Maintainer**: m0rs3c0d3
+**Maintainer**: noisyloop
 **Scope**: Commercial LLM API providers (OpenAI, Anthropic, Google, Mistral-class services)
 
 ---

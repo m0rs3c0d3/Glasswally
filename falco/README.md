@@ -179,7 +179,7 @@ func (p *GlasswallPlugin) Info() *plugins.Info {
         ID:          42,
         Name:        "glasswally",
         Description: "LLM distillation attack detection events from Glasswally",
-        Contact:     "https://github.com/m0rs3c0d3/glasswally",
+        Contact:     "https://github.com/noisyloop/Glasswally",
         Version:     "0.1.0",
         EventSource: "glasswally",
     }
